@@ -1,0 +1,73 @@
+use std::{
+    env,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use crate::gba::memory_map::IO_START;
+
+pub fn trace_timer_register_write(addr: u32, value: u16) {
+    if trace_enabled("KGBA_TRACE_TIMER") {
+        eprintln!(
+            "kgba timer write addr={addr:#010x} value={value:#06x} kind={}",
+            if (addr - (IO_START + 0x0100)) & 0x2 == 0 {
+                "reload"
+            } else {
+                "control"
+            }
+        );
+    }
+}
+
+pub fn trace_timer_counter(timer_index: usize, value: u16, ticks: u32, overflows: u32) {
+    if !trace_enabled("KGBA_TRACE_TIMER") || ticks == 0 {
+        return;
+    }
+
+    static COUNTER_LOGS: AtomicU64 = AtomicU64::new(0);
+    let log_index = COUNTER_LOGS.fetch_add(1, Ordering::Relaxed);
+    if log_index < 32 || log_index.is_multiple_of(1024) {
+        eprintln!(
+            "kgba timer advance timer={} value={} ticks={} overflows={}",
+            timer_index, value, ticks, overflows
+        );
+    }
+}
+
+pub fn trace_io_mmio(kind: &str, addr: u32, len: u32, data: &[u8; 8]) {
+    if !trace_enabled("KGBA_TRACE_MMIO") && !is_timer_register_access(addr, len) {
+        return;
+    }
+
+    eprintln!(
+        "kgba mmio {kind} addr={addr:#010x} len={} data={}",
+        len,
+        format_mmio_data(data, len)
+    );
+}
+
+fn is_timer_register_access(addr: u32, len: u32) -> bool {
+    let end = addr.saturating_add(len);
+    addr < IO_START + 0x0110 && end > IO_START + 0x0100
+}
+
+fn format_mmio_data(data: &[u8; 8], len: u32) -> String {
+    data[..len as usize]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn trace_enabled(name: &'static str) -> bool {
+    static TIMER: OnceLock<bool> = OnceLock::new();
+    static MMIO: OnceLock<bool> = OnceLock::new();
+
+    match name {
+        "KGBA_TRACE_TIMER" => *TIMER.get_or_init(|| env::var_os(name).is_some()),
+        "KGBA_TRACE_MMIO" => *MMIO.get_or_init(|| env::var_os(name).is_some()),
+        _ => false,
+    }
+}
