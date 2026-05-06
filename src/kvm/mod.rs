@@ -18,7 +18,7 @@ use crate::gba::{
     cartridge::Cartridge,
     memory_map::{
         BIOS_SIZE, BIOS_START, EWRAM_SIZE, EWRAM_START, GAME_PAK_ROM_START, IO_SIZE, IO_START,
-        IWRAM_SIZE, IWRAM_START, OAM_START, PALETTE_START, VRAM_SIZE, VRAM_START,
+        IWRAM_SIZE, IWRAM_START, KEYINPUT, OAM_START, PALETTE_START, VRAM_SIZE, VRAM_START,
     },
 };
 
@@ -105,7 +105,7 @@ impl KvmGba {
             vram_slot.region.clone_for_shared(),
             oam_slot.region.clone_for_shared(),
         ));
-        shared.write_io_u16(IO_START + 0x0130, 0x03ff);
+        shared.write_io_u16(KEYINPUT, 0x03ff);
         slots.push(bios_slot);
         slots.push(iwram_slot);
         slots.push(io_slot);

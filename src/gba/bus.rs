@@ -1,6 +1,9 @@
 use super::{
     memory::GbaMemory,
-    memory_map::{DISPCNT, DISPSTAT, IO_START, VCOUNT},
+    memory_map::{
+        BG0CNT, BG0HOFS, BG0VOFS, BG1CNT, BG1HOFS, BG1VOFS, BG2CNT, BG2HOFS, BG2VOFS, BG3CNT,
+        BG3HOFS, BG3VOFS, DISPCNT, DISPSTAT, IO_START, KEYINPUT, VCOUNT,
+    },
     ppu::{FrameBuffer, Ppu},
 };
 
@@ -79,6 +82,19 @@ impl<'a> Bus<'a> {
             DISPCNT => self.ppu.dispcnt(),
             DISPSTAT => self.ppu.dispstat(),
             VCOUNT => self.ppu.vcount().into(),
+            BG0CNT => self.ppu.bgcnt(0),
+            BG1CNT => self.ppu.bgcnt(1),
+            BG2CNT => self.ppu.bgcnt(2),
+            BG3CNT => self.ppu.bgcnt(3),
+            BG0HOFS => self.ppu.bghofs(0),
+            BG1HOFS => self.ppu.bghofs(1),
+            BG2HOFS => self.ppu.bghofs(2),
+            BG3HOFS => self.ppu.bghofs(3),
+            BG0VOFS => self.ppu.bgvofs(0),
+            BG1VOFS => self.ppu.bgvofs(1),
+            BG2VOFS => self.ppu.bgvofs(2),
+            BG3VOFS => self.ppu.bgvofs(3),
+            KEYINPUT => 0x03ff,
             IO_START..=0x0400_03ff => 0,
             _ => 0,
         }
@@ -99,6 +115,18 @@ impl<'a> Bus<'a> {
         match addr {
             DISPCNT => self.ppu.write_dispcnt(value),
             DISPSTAT => self.ppu.write_dispstat(value),
+            BG0CNT => self.ppu.write_bgcnt(0, value),
+            BG1CNT => self.ppu.write_bgcnt(1, value),
+            BG2CNT => self.ppu.write_bgcnt(2, value),
+            BG3CNT => self.ppu.write_bgcnt(3, value),
+            BG0HOFS => self.ppu.write_bghofs(0, value),
+            BG1HOFS => self.ppu.write_bghofs(1, value),
+            BG2HOFS => self.ppu.write_bghofs(2, value),
+            BG3HOFS => self.ppu.write_bghofs(3, value),
+            BG0VOFS => self.ppu.write_bgvofs(0, value),
+            BG1VOFS => self.ppu.write_bgvofs(1, value),
+            BG2VOFS => self.ppu.write_bgvofs(2, value),
+            BG3VOFS => self.ppu.write_bgvofs(3, value),
             IO_START..=0x0400_03ff => {}
             _ => {}
         }

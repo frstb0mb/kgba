@@ -57,6 +57,45 @@ impl GbaMemory {
         self.vram[byte_offset] = bytes[0];
         self.vram[byte_offset + 1] = bytes[1];
     }
+
+    pub fn write_palette_halfword(&mut self, byte_offset: usize, value: u16) {
+        let bytes = value.to_le_bytes();
+        self.palette[byte_offset] = bytes[0];
+        self.palette[byte_offset + 1] = bytes[1];
+    }
+
+    pub fn read_ewram_word(&self, byte_offset: usize) -> u32 {
+        read_u32(self.ewram.as_ref(), byte_offset)
+    }
+
+    pub fn write_ewram_word(&mut self, byte_offset: usize, value: u32) {
+        write_u32(self.ewram.as_mut(), byte_offset, value);
+    }
+
+    pub fn read_iwram_word(&self, byte_offset: usize) -> u32 {
+        read_u32(self.iwram.as_ref(), byte_offset)
+    }
+
+    pub fn write_iwram_word(&mut self, byte_offset: usize, value: u32) {
+        write_u32(self.iwram.as_mut(), byte_offset, value);
+    }
+}
+
+fn read_u32(memory: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        memory[offset],
+        memory[offset + 1],
+        memory[offset + 2],
+        memory[offset + 3],
+    ])
+}
+
+fn write_u32(memory: &mut [u8], offset: usize, value: u32) {
+    let bytes = value.to_le_bytes();
+    memory[offset] = bytes[0];
+    memory[offset + 1] = bytes[1];
+    memory[offset + 2] = bytes[2];
+    memory[offset + 3] = bytes[3];
 }
 
 impl Default for GbaMemory {

@@ -10,9 +10,16 @@ pub const MODE_5: u16 = 0x0005;
 pub const DISPCNT_MODE_MASK: u16 = 0x0007;
 pub const BACKBUFFER: u16 = 1 << 4;
 pub const OBJ_1D_MAPPING: u16 = 1 << 6;
+pub const BG0_ENABLE: u16 = 1 << 8;
+pub const BG1_ENABLE: u16 = 1 << 9;
 pub const BG2_ENABLE: u16 = 1 << 10;
+pub const BG3_ENABLE: u16 = 1 << 11;
 pub const OBJ_ENABLE: u16 = 1 << 12;
 
+const BG_ENABLE: [u16; 4] = [BG0_ENABLE, BG1_ENABLE, BG2_ENABLE, BG3_ENABLE];
+const BG_TILE_SIZE: usize = 8;
+const SCREEN_BLOCK_SIZE: usize = 0x800;
+const CHAR_BLOCK_SIZE: usize = 0x4000;
 const MODE5_WIDTH: usize = 160;
 const MODE5_HEIGHT: usize = 128;
 const OBJ_TILE_BASE_TEXT_MODE: usize = 0x10000;
@@ -32,6 +39,9 @@ pub struct Ppu {
     dispcnt: u16,
     dispstat: u16,
     vcount: u16,
+    bgcnt: [u16; 4],
+    bghofs: [u16; 4],
+    bgvofs: [u16; 4],
 }
 
 impl Ppu {
@@ -71,6 +81,30 @@ impl Ppu {
         self.dispstat = value & (DISPSTAT_IRQ_WRITABLE_MASK | DISPSTAT_VCOUNT_SETTING_MASK);
     }
 
+    pub fn bgcnt(&self, bg: usize) -> u16 {
+        self.bgcnt[bg]
+    }
+
+    pub fn bghofs(&self, bg: usize) -> u16 {
+        self.bghofs[bg]
+    }
+
+    pub fn bgvofs(&self, bg: usize) -> u16 {
+        self.bgvofs[bg]
+    }
+
+    pub fn write_bgcnt(&mut self, bg: usize, value: u16) {
+        self.bgcnt[bg] = value;
+    }
+
+    pub fn write_bghofs(&mut self, bg: usize, value: u16) {
+        self.bghofs[bg] = value & 0x01ff;
+    }
+
+    pub fn write_bgvofs(&mut self, bg: usize, value: u16) {
+        self.bgvofs[bg] = value & 0x01ff;
+    }
+
     pub fn step_scanline(&mut self) {
         self.vcount += 1;
         if self.vcount >= TOTAL_SCANLINES {
@@ -88,7 +122,7 @@ impl Ppu {
 
     pub fn render_frame(&self, palette: &[u8], vram: &[u8], oam: &[u8]) -> FrameBuffer {
         let mut frame = match self.dispcnt & DISPCNT_MODE_MASK {
-            MODE_0 => vec![0xff000000; WIDTH * HEIGHT],
+            MODE_0 => self.render_mode0(palette, vram),
             MODE_3 => self.render_mode3(vram),
             MODE_4 => self.render_mode4(palette, vram),
             MODE_5 => self.render_mode5(vram),
@@ -97,6 +131,26 @@ impl Ppu {
 
         if self.dispcnt & OBJ_ENABLE != 0 {
             self.render_objs(palette, vram, oam, &mut frame);
+        }
+
+        frame
+    }
+
+    pub fn render_mode0(&self, palette: &[u8], vram: &[u8]) -> FrameBuffer {
+        let backdrop = read_u16_checked(palette, 0).map_or(0xff000000, bgr555_to_argb8888);
+        let mut frame = vec![backdrop; WIDTH * HEIGHT];
+
+        if (self.dispcnt & DISPCNT_MODE_MASK) != MODE_0 {
+            return frame;
+        }
+
+        let mut bgs = [0usize, 1, 2, 3];
+        bgs.sort_by_key(|&bg| (self.bg_priority(bg), bg));
+        for bg in bgs.into_iter().rev() {
+            if self.dispcnt & BG_ENABLE[bg] == 0 {
+                continue;
+            }
+            self.render_text_bg(bg, palette, vram, &mut frame);
         }
 
         frame
@@ -255,6 +309,44 @@ impl Ppu {
             _ => OBJ_TILE_BASE_BITMAP_MODE,
         }
     }
+
+    fn render_text_bg(&self, bg: usize, palette: &[u8], vram: &[u8], frame: &mut [u32]) {
+        let bgcnt = self.bgcnt[bg];
+        let char_base = usize::from((bgcnt >> 2) & 0x3) * CHAR_BLOCK_SIZE;
+        let screen_base = usize::from((bgcnt >> 8) & 0x1f) * SCREEN_BLOCK_SIZE;
+        let is_8bpp = bgcnt & (1 << 7) != 0;
+        let (bg_width, bg_height) = text_bg_size(bgcnt);
+
+        for y in 0..HEIGHT {
+            let bg_y = (y + usize::from(self.bgvofs[bg])) % bg_height;
+            for x in 0..WIDTH {
+                let bg_x = (x + usize::from(self.bghofs[bg])) % bg_width;
+                let Some(color_index) = text_bg_color_index(
+                    vram,
+                    char_base,
+                    screen_base,
+                    is_8bpp,
+                    bg_width,
+                    bg_x,
+                    bg_y,
+                ) else {
+                    continue;
+                };
+                if color_index == 0 {
+                    continue;
+                }
+
+                let palette_offset = usize::from(color_index) * 2;
+                if let Some(color) = read_u16_checked(palette, palette_offset) {
+                    frame[y * WIDTH + x] = bgr555_to_argb8888(color);
+                }
+            }
+        }
+    }
+
+    fn bg_priority(&self, bg: usize) -> u16 {
+        self.bgcnt[bg] & 0x3
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -282,6 +374,69 @@ fn obj_4bpp_color(vram: &[u8], base: usize, tile_number: usize, pixel_in_tile: u
     } else {
         color_byte >> 4
     }
+}
+
+fn text_bg_color_index(
+    vram: &[u8],
+    char_base: usize,
+    screen_base: usize,
+    is_8bpp: bool,
+    bg_width: usize,
+    bg_x: usize,
+    bg_y: usize,
+) -> Option<u16> {
+    let tile_x = bg_x / BG_TILE_SIZE;
+    let tile_y = bg_y / BG_TILE_SIZE;
+    let screen_block = match (bg_width > 256, bg_y >= 256) {
+        (false, false) => 0,
+        (true, false) => tile_x / 32,
+        (false, true) => 1,
+        (true, true) => 2 + tile_x / 32,
+    };
+    let map_x = tile_x % 32;
+    let map_y = tile_y % 32;
+    let map_offset = screen_base + screen_block * SCREEN_BLOCK_SIZE + (map_y * 32 + map_x) * 2;
+    let entry = read_u16_checked(vram, map_offset)?;
+
+    let tile_number = usize::from(entry & 0x03ff);
+    let mut pixel_x = bg_x % BG_TILE_SIZE;
+    let mut pixel_y = bg_y % BG_TILE_SIZE;
+    if entry & (1 << 10) != 0 {
+        pixel_x = BG_TILE_SIZE - 1 - pixel_x;
+    }
+    if entry & (1 << 11) != 0 {
+        pixel_y = BG_TILE_SIZE - 1 - pixel_y;
+    }
+
+    if is_8bpp {
+        let tile_offset = char_base + tile_number * 64 + pixel_y * BG_TILE_SIZE + pixel_x;
+        vram.get(tile_offset).copied().map(u16::from)
+    } else {
+        let tile_offset = char_base + tile_number * 32 + (pixel_y * BG_TILE_SIZE + pixel_x) / 2;
+        let byte = *vram.get(tile_offset)?;
+        let color = if pixel_x & 1 == 0 {
+            byte & 0x0f
+        } else {
+            byte >> 4
+        };
+        Some(((entry >> 12) & 0x0f) * 16 + u16::from(color))
+    }
+}
+
+fn text_bg_size(bgcnt: u16) -> (usize, usize) {
+    match (bgcnt >> 14) & 0x3 {
+        0 => (256, 256),
+        1 => (512, 256),
+        2 => (256, 512),
+        _ => (512, 512),
+    }
+}
+
+fn read_u16_checked(memory: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes([
+        *memory.get(offset)?,
+        *memory.get(offset + 1)?,
+    ]))
 }
 
 fn read_u16(memory: &[u8], offset: usize) -> u16 {
@@ -386,6 +541,25 @@ mod tests {
 
         ppu.write_dispcnt(MODE_5 | BG2_ENABLE | BACKBUFFER);
         assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], 0xff0000ff);
+    }
+
+    #[test]
+    fn mode0_renders_bg0_8bpp_text_tiles() {
+        let mut palette = vec![0; 0x400];
+        palette[2..4].copy_from_slice(&rgb5(31, 0, 0).to_le_bytes());
+
+        let mut vram = vec![0; 0x18000];
+        vram[64] = 1;
+        write_vram_halfword_offset(&mut vram, 8 * SCREEN_BLOCK_SIZE, 1);
+
+        let mut ppu = Ppu::new();
+        ppu.write_dispcnt(MODE_0 | BG0_ENABLE);
+        ppu.write_bgcnt(0, (1 << 7) | (8 << 8));
+
+        let frame = ppu.render_mode0(&palette, &vram);
+
+        assert_eq!(frame[0], 0xffff0000);
+        assert_eq!(frame[1], 0xff000000);
     }
 
     #[test]
@@ -533,6 +707,10 @@ mod tests {
 
     fn write_vram_halfword(vram: &mut [u8], x: usize, y: usize, value: u16) {
         let offset = (y * WIDTH + x) * 2;
+        write_vram_halfword_offset(vram, offset, value);
+    }
+
+    fn write_vram_halfword_offset(vram: &mut [u8], offset: usize, value: u16) {
         let bytes = value.to_le_bytes();
         vram[offset] = bytes[0];
         vram[offset + 1] = bytes[1];

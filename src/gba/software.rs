@@ -2,7 +2,7 @@ use super::{
     bus::{AccessSize, Bus},
     cartridge::Cartridge,
     memory_map::{
-        DISPCNT, EWRAM_START, GAME_PAK_ROM_START, IO_START, IWRAM_START, VCOUNT, VRAM_START,
+        EWRAM_START, GAME_PAK_ROM_START, IO_START, IWRAM_START, PALETTE_START, VCOUNT, VRAM_START,
     },
 };
 
@@ -55,7 +55,7 @@ impl SoftwareRunner {
                 self.step_arm(cartridge, bus)?;
             }
 
-            if self.instructions > 100 && self.regs[15] >= GAME_PAK_ROM_START + 0x25e {
+            if self.instructions > 100 && self.vcount_reads >= 3 {
                 return Ok(RunResult::FrameReady);
             }
         }
@@ -160,16 +160,76 @@ impl SoftwareRunner {
                 let addr = self.regs[rb].wrapping_add(self.regs[ro]);
                 self.write_u16(addr, self.regs[rd] as u16, bus);
             }
+            op if (op & 0xfe00) == 0x5000 => {
+                let ro = ((op >> 6) & 0x7) as usize;
+                let rb = ((op >> 3) & 0x7) as usize;
+                let rd = (op & 0x7) as usize;
+                let addr = self.regs[rb].wrapping_add(self.regs[ro]);
+                self.write_data_u32(addr, self.regs[rd], bus);
+            }
+            op if (op & 0xfe00) == 0x5800 => {
+                let ro = ((op >> 6) & 0x7) as usize;
+                let rb = ((op >> 3) & 0x7) as usize;
+                let rd = (op & 0x7) as usize;
+                let addr = self.regs[rb].wrapping_add(self.regs[ro]);
+                self.regs[rd] = self.read_data_u32(addr, cartridge, bus);
+            }
+            op if (op & 0xfe00) == 0x5a00 => {
+                let ro = ((op >> 6) & 0x7) as usize;
+                let rb = ((op >> 3) & 0x7) as usize;
+                let rd = (op & 0x7) as usize;
+                let addr = self.regs[rb].wrapping_add(self.regs[ro]);
+                self.regs[rd] = u32::from(self.read_data_u16(addr, cartridge, bus));
+            }
+            op if (op & 0xf800) == 0x6000 => {
+                let rb = ((op >> 3) & 0x7) as usize;
+                let rd = (op & 0x7) as usize;
+                let addr = self.regs[rb].wrapping_add(u32::from((op >> 6) & 0x1f) * 4);
+                self.write_data_u32(addr, self.regs[rd], bus);
+            }
+            op if (op & 0xf800) == 0x6800 => {
+                let rb = ((op >> 3) & 0x7) as usize;
+                let rd = (op & 0x7) as usize;
+                let addr = self.regs[rb].wrapping_add(u32::from((op >> 6) & 0x1f) * 4);
+                self.regs[rd] = self.read_data_u32(addr, cartridge, bus);
+            }
             op if (op & 0xf800) == 0x8800 => {
                 let rb = ((op >> 3) & 0x7) as usize;
                 let rd = (op & 0x7) as usize;
                 let addr = self.regs[rb].wrapping_add(u32::from((op >> 6) & 0x1f) * 2);
-                self.regs[rd] = u32::from(self.read_u16(addr, bus));
+                self.regs[rd] = u32::from(self.read_data_u16(addr, cartridge, bus));
+            }
+            op if (op & 0xf800) == 0xa000 => {
+                let rd = ((op >> 8) & 0x7) as usize;
+                let imm = u32::from(op & 0xff) * 4;
+                self.regs[rd] = ((pc + 4) & !3).wrapping_add(imm);
+            }
+            op if (op & 0xf800) == 0xa800 => {
+                let rd = ((op >> 8) & 0x7) as usize;
+                self.regs[rd] = self.regs[13].wrapping_add(u32::from(op & 0xff) * 4);
+            }
+            op if (op & 0xf800) == 0x9000 => {
+                let rd = ((op >> 8) & 0x7) as usize;
+                let addr = self.regs[13].wrapping_add(u32::from(op & 0xff) * 4);
+                self.write_data_u32(addr, self.regs[rd], bus);
+            }
+            op if (op & 0xf800) == 0x9800 => {
+                let rd = ((op >> 8) & 0x7) as usize;
+                let addr = self.regs[13].wrapping_add(u32::from(op & 0xff) * 4);
+                self.regs[rd] = self.read_data_u32(addr, cartridge, bus);
             }
             op if (op & 0xfc00) == 0x4000 => self.step_alu(op)?,
             op if (op & 0xfc00) == 0x4400 => self.step_high_register(op),
-            op if (op & 0xff00) == 0xb500 => self.push(op),
-            0xb500..=0xb5ff => self.push(op),
+            op if (op & 0xff00) == 0xb500 => self.push(op, bus),
+            0xb500..=0xb5ff => self.push(op, bus),
+            op if (op & 0xff00) == 0xbc00 => self.pop(op, cartridge, bus),
+            op if (op & 0xff00) == 0xbd00 => self.pop(op, cartridge, bus),
+            op if (op & 0xff80) == 0xb000 => {
+                self.regs[13] = self.regs[13].wrapping_add(u32::from(op & 0x7f) * 4);
+            }
+            op if (op & 0xff80) == 0xb080 => {
+                self.regs[13] = self.regs[13].wrapping_sub(u32::from(op & 0x7f) * 4);
+            }
             op if (op & 0xf000) == 0xd000 => self.conditional_branch(op),
             op if (op & 0xf800) == 0xe000 => {
                 let mut offset = u32::from(op & 0x07ff);
@@ -178,6 +238,20 @@ impl SoftwareRunner {
                 }
                 self.regs[15] = self.regs[15].wrapping_add(((offset as i32) << 1) as u32);
             }
+            op if (op & 0xf800) == 0xf000 => {
+                let mut offset = u32::from(op & 0x07ff);
+                if offset & 0x0400 != 0 {
+                    offset |= 0xffff_f800;
+                }
+                self.regs[14] = pc.wrapping_add(4).wrapping_add(offset << 12);
+            }
+            op if (op & 0xf800) == 0xf800 => {
+                let target = self.regs[14].wrapping_add(u32::from(op & 0x07ff) << 1);
+                self.regs[14] = self.regs[15] | 1;
+                self.regs[15] = target;
+            }
+            op if (op & 0xf800) == 0xc000 => self.stmia(op, bus),
+            op if (op & 0xf800) == 0xc800 => self.ldmia(op, cartridge, bus),
             0xdf00 => return Ok(()),
             _ => return Err(format!("unsupported Thumb op {op:#06x} at {pc:#010x}")),
         }
@@ -191,6 +265,7 @@ impl SoftwareRunner {
         match (op >> 6) & 0xf {
             0x8 => self.set_cmp(self.regs[rd], self.regs[rs]),
             0xa => self.set_cmp(self.regs[rd], self.regs[rs]),
+            0xc => self.regs[rd] |= self.regs[rs],
             0xe => self.regs[rd] &= !self.regs[rs],
             _ => return Err(format!("unsupported Thumb ALU op {op:#06x}")),
         }
@@ -228,12 +303,117 @@ impl SoftwareRunner {
         }
     }
 
-    fn push(&mut self, op: u16) {
-        let mut count = (op & 0xff).count_ones();
-        if op & 0x0100 != 0 {
-            count += 1;
+    fn push(&mut self, op: u16, bus: &mut Bus<'_>) {
+        let mut sp = self.regs[13];
+        let count = (op & 0xff).count_ones() + u32::from(op & 0x0100 != 0);
+        sp = sp.wrapping_sub(count * 4);
+        let mut addr = sp;
+        for reg in 0..8 {
+            if op & (1 << reg) != 0 {
+                self.write_data_u32(addr, self.regs[reg], bus);
+                addr = addr.wrapping_add(4);
+            }
         }
-        self.regs[13] = self.regs[13].wrapping_sub(count * 4);
+        if op & 0x0100 != 0 {
+            self.write_data_u32(addr, self.regs[14], bus);
+        }
+        self.regs[13] = sp;
+    }
+
+    fn pop(&mut self, op: u16, cartridge: &Cartridge, bus: &mut Bus<'_>) {
+        let mut addr = self.regs[13];
+        for reg in 0..8 {
+            if op & (1 << reg) != 0 {
+                self.regs[reg] = self.read_data_u32(addr, cartridge, bus);
+                addr = addr.wrapping_add(4);
+            }
+        }
+        if op & 0x0100 != 0 {
+            let value = self.read_data_u32(addr, cartridge, bus);
+            self.branch_exchange(value);
+            addr = addr.wrapping_add(4);
+        }
+        self.regs[13] = addr;
+    }
+
+    fn stmia(&mut self, op: u16, bus: &mut Bus<'_>) {
+        let rb = ((op >> 8) & 0x7) as usize;
+        let mut addr = self.regs[rb];
+        for reg in 0..8 {
+            if op & (1 << reg) != 0 {
+                self.write_data_u32(addr, self.regs[reg], bus);
+                addr = addr.wrapping_add(4);
+            }
+        }
+        self.regs[rb] = addr;
+    }
+
+    fn ldmia(&mut self, op: u16, cartridge: &Cartridge, bus: &mut Bus<'_>) {
+        let rb = ((op >> 8) & 0x7) as usize;
+        let mut addr = self.regs[rb];
+        for reg in 0..8 {
+            if op & (1 << reg) != 0 {
+                self.regs[reg] = self.read_data_u32(addr, cartridge, bus);
+                addr = addr.wrapping_add(4);
+            }
+        }
+        self.regs[rb] = addr;
+    }
+
+    fn read_data_u32(&mut self, addr: u32, cartridge: &Cartridge, bus: &mut Bus<'_>) -> u32 {
+        if (GAME_PAK_ROM_START..GAME_PAK_ROM_START + cartridge.rom().len() as u32).contains(&addr) {
+            cartridge.read_u32(addr)
+        } else if (EWRAM_START..EWRAM_START + 0x40000).contains(&addr) {
+            bus.memory_mut()
+                .read_ewram_word((addr - EWRAM_START) as usize)
+        } else if (IWRAM_START..IWRAM_START + 0x8000).contains(&addr) {
+            bus.memory_mut()
+                .read_iwram_word((addr - IWRAM_START) as usize)
+        } else {
+            0
+        }
+    }
+
+    fn read_data_u16(&mut self, addr: u32, cartridge: &Cartridge, bus: &mut Bus<'_>) -> u16 {
+        if addr == VCOUNT || (IO_START..IO_START + 0x400).contains(&addr) {
+            self.read_u16(addr, bus)
+        } else if (GAME_PAK_ROM_START..GAME_PAK_ROM_START + cartridge.rom().len() as u32)
+            .contains(&addr)
+        {
+            cartridge.read_u16(addr)
+        } else if (EWRAM_START..EWRAM_START + 0x40000).contains(&addr) {
+            let word = bus
+                .memory_mut()
+                .read_ewram_word(((addr - EWRAM_START) as usize) & !3);
+            if addr & 2 == 0 {
+                word as u16
+            } else {
+                (word >> 16) as u16
+            }
+        } else if (IWRAM_START..IWRAM_START + 0x8000).contains(&addr) {
+            let word = bus
+                .memory_mut()
+                .read_iwram_word(((addr - IWRAM_START) as usize) & !3);
+            if addr & 2 == 0 {
+                word as u16
+            } else {
+                (word >> 16) as u16
+            }
+        } else {
+            0
+        }
+    }
+
+    fn write_data_u32(&mut self, addr: u32, value: u32, bus: &mut Bus<'_>) {
+        if (IO_START..IO_START + 0x400).contains(&addr) {
+            bus.write(addr, AccessSize::Word, value);
+        } else if (EWRAM_START..EWRAM_START + 0x40000).contains(&addr) {
+            bus.memory_mut()
+                .write_ewram_word((addr - EWRAM_START) as usize, value);
+        } else if (IWRAM_START..IWRAM_START + 0x8000).contains(&addr) {
+            bus.memory_mut()
+                .write_iwram_word((addr - IWRAM_START) as usize, value);
+        }
     }
 
     fn read_u16(&mut self, addr: u32, bus: &mut Bus<'_>) -> u16 {
@@ -247,8 +427,11 @@ impl SoftwareRunner {
     }
 
     fn write_u16(&mut self, addr: u32, value: u16, bus: &mut Bus<'_>) {
-        if addr == DISPCNT {
+        if (IO_START..IO_START + 0x400).contains(&addr) {
             bus.write(addr, AccessSize::Halfword, u32::from(value));
+        } else if (PALETTE_START..PALETTE_START + 0x400).contains(&addr) {
+            let offset = (addr - PALETTE_START) as usize;
+            bus.memory_mut().write_palette_halfword(offset, value);
         } else if (VRAM_START..VRAM_START + 0x18000).contains(&addr) {
             let offset = (addr - VRAM_START) as usize;
             bus.memory_mut().write_vram_halfword(offset, value);

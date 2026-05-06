@@ -1,7 +1,10 @@
 use std::sync::Mutex;
 
 use crate::gba::{
-    memory_map::{DISPCNT, IO_START, VCOUNT},
+    memory_map::{
+        BG0CNT, BG0HOFS, BG0VOFS, BG1CNT, BG1HOFS, BG1VOFS, BG2CNT, BG2HOFS, BG2VOFS, BG3CNT,
+        BG3HOFS, BG3VOFS, DISPCNT, IO_START, KEYINPUT, VCOUNT,
+    },
     ppu::{FrameBuffer, Ppu},
 };
 
@@ -44,12 +47,24 @@ impl KvmSharedMemory {
     }
 
     pub fn set_keyinput(&self, value: u16) {
-        self.write_io_u16(IO_START + 0x0130, value);
+        self.write_io_u16(KEYINPUT, value);
     }
 
     pub fn render_frame(&self) -> FrameBuffer {
         let mut ppu = Ppu::new();
         ppu.write_dispcnt(self.read_io_u16(DISPCNT));
+        ppu.write_bgcnt(0, self.read_io_u16(BG0CNT));
+        ppu.write_bgcnt(1, self.read_io_u16(BG1CNT));
+        ppu.write_bgcnt(2, self.read_io_u16(BG2CNT));
+        ppu.write_bgcnt(3, self.read_io_u16(BG3CNT));
+        ppu.write_bghofs(0, self.read_io_u16(BG0HOFS));
+        ppu.write_bghofs(1, self.read_io_u16(BG1HOFS));
+        ppu.write_bghofs(2, self.read_io_u16(BG2HOFS));
+        ppu.write_bghofs(3, self.read_io_u16(BG3HOFS));
+        ppu.write_bgvofs(0, self.read_io_u16(BG0VOFS));
+        ppu.write_bgvofs(1, self.read_io_u16(BG1VOFS));
+        ppu.write_bgvofs(2, self.read_io_u16(BG2VOFS));
+        ppu.write_bgvofs(3, self.read_io_u16(BG3VOFS));
         ppu.render_frame(
             self.palette.as_slice(),
             self.vram.as_slice(),
