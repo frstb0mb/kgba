@@ -2,7 +2,7 @@ use super::{
     memory::GbaMemory,
     memory_map::{
         BG0CNT, BG0HOFS, BG0VOFS, BG1CNT, BG1HOFS, BG1VOFS, BG2CNT, BG2HOFS, BG2VOFS, BG3CNT,
-        BG3HOFS, BG3VOFS, DISPCNT, DISPSTAT, IO_START, KEYINPUT, VCOUNT,
+        BG3HOFS, BG3VOFS, DISPCNT, DISPSTAT, IO_SIZE, IO_START, KEYINPUT, VCOUNT,
     },
     ppu::{FrameBuffer, Ppu},
 };
@@ -18,13 +18,20 @@ pub enum AccessSize {
 pub struct Bus<'a> {
     memory: &'a mut GbaMemory,
     ppu: Ppu,
+    io: Box<[u8; IO_SIZE]>,
 }
 
 impl<'a> Bus<'a> {
     pub fn new(memory: &'a mut GbaMemory) -> Self {
+        let mut io = Box::new([0; IO_SIZE]);
+        let keyinput = (0x03ffu16).to_le_bytes();
+        let keyinput_offset = (KEYINPUT - IO_START) as usize;
+        io[keyinput_offset] = keyinput[0];
+        io[keyinput_offset + 1] = keyinput[1];
         Self {
             memory,
             ppu: Ppu::new(),
+            io,
         }
     }
 
@@ -95,7 +102,7 @@ impl<'a> Bus<'a> {
             BG2VOFS => self.ppu.bgvofs(2),
             BG3VOFS => self.ppu.bgvofs(3),
             KEYINPUT => 0x03ff,
-            IO_START..=0x0400_03ff => 0,
+            IO_START..=0x0400_03ff => self.read_io_halfword(addr),
             _ => 0,
         }
     }
@@ -112,6 +119,9 @@ impl<'a> Bus<'a> {
     }
 
     fn write_halfword(&mut self, addr: u32, value: u16) {
+        if (IO_START..=0x0400_03ff).contains(&addr) {
+            self.write_io_halfword(addr, value);
+        }
         match addr {
             DISPCNT => self.ppu.write_dispcnt(value),
             DISPSTAT => self.ppu.write_dispstat(value),
@@ -130,6 +140,18 @@ impl<'a> Bus<'a> {
             IO_START..=0x0400_03ff => {}
             _ => {}
         }
+    }
+
+    fn read_io_halfword(&self, addr: u32) -> u16 {
+        let offset = (addr - IO_START) as usize;
+        u16::from_le_bytes([self.io[offset], self.io[offset + 1]])
+    }
+
+    fn write_io_halfword(&mut self, addr: u32, value: u16) {
+        let offset = (addr - IO_START) as usize;
+        let bytes = value.to_le_bytes();
+        self.io[offset] = bytes[0];
+        self.io[offset + 1] = bytes[1];
     }
 }
 

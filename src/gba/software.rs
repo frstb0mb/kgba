@@ -9,12 +9,19 @@
 use super::{
     bus::{AccessSize, Bus},
     cartridge::Cartridge,
+    memory::MemoryRegionKind,
     memory_map::{
-        EWRAM_START, GAME_PAK_ROM_START, IO_START, IWRAM_START, PALETTE_START, VCOUNT, VRAM_START,
+        DMA0CNT, DMA0SAD, EWRAM_SIZE, EWRAM_START, GAME_PAK_ROM_START, IO_START, IWRAM_SIZE,
+        IWRAM_START, OAM_SIZE, OAM_START, PALETTE_SIZE, PALETTE_START, VCOUNT, VRAM_SIZE,
+        VRAM_START,
     },
 };
 
 const DEFAULT_MAX_INSTRUCTIONS: usize = 200_000;
+const DMA_ENABLE: u16 = 1 << 15;
+const DMA_REPEAT: u16 = 1 << 9;
+const DMA_32BIT: u16 = 1 << 10;
+const DMA_TIMING_MASK: u16 = 0x3000;
 
 #[derive(Debug)]
 pub struct SoftwareRunner {
@@ -22,6 +29,7 @@ pub struct SoftwareRunner {
     thumb: bool,
     instructions: usize,
     vcount_reads: u32,
+    rom: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -47,6 +55,7 @@ impl SoftwareRunner {
             thumb,
             instructions: 0,
             vcount_reads: 0,
+            rom: cartridge.rom().to_vec(),
         }
     }
 
@@ -415,6 +424,8 @@ impl SoftwareRunner {
     fn write_data_u32(&mut self, addr: u32, value: u32, bus: &mut Bus<'_>) {
         if (IO_START..IO_START + 0x400).contains(&addr) {
             bus.write(addr, AccessSize::Word, value);
+            self.run_immediate_dma_if_enabled(addr, bus);
+            self.run_immediate_dma_if_enabled(addr + 2, bus);
         } else if (EWRAM_START..EWRAM_START + 0x40000).contains(&addr) {
             bus.memory_mut()
                 .write_ewram_word((addr - EWRAM_START) as usize, value);
@@ -437,6 +448,7 @@ impl SoftwareRunner {
     fn write_u16(&mut self, addr: u32, value: u16, bus: &mut Bus<'_>) {
         if (IO_START..IO_START + 0x400).contains(&addr) {
             bus.write(addr, AccessSize::Halfword, u32::from(value));
+            self.run_immediate_dma_if_enabled(addr, bus);
         } else if (PALETTE_START..PALETTE_START + 0x400).contains(&addr) {
             let offset = (addr - PALETTE_START) as usize;
             bus.memory_mut().write_palette_halfword(offset, value);
@@ -449,6 +461,8 @@ impl SoftwareRunner {
     fn write_u32(&mut self, addr: u32, value: u32, bus: &mut Bus<'_>) {
         if (IO_START..IO_START + 0x400).contains(&addr) {
             bus.write(addr, AccessSize::Word, value);
+            self.run_immediate_dma_if_enabled(addr, bus);
+            self.run_immediate_dma_if_enabled(addr + 2, bus);
         } else if (EWRAM_START..EWRAM_START + 0x40000).contains(&addr)
             || (IWRAM_START..IWRAM_START + 0x8000).contains(&addr)
         {
@@ -477,5 +491,147 @@ impl SoftwareRunner {
 
     fn c(&self) -> bool {
         self.regs[14] & (1 << 29) != 0
+    }
+
+    fn run_immediate_dma_if_enabled(&mut self, addr: u32, bus: &mut Bus<'_>) {
+        let Some(channel) = dma_channel_for_cnt_high(addr) else {
+            return;
+        };
+
+        let base = DMA0SAD + channel as u32 * 12;
+        let control = bus.read(base + 10, AccessSize::Halfword) as u16;
+        if control & DMA_ENABLE == 0 || control & DMA_TIMING_MASK != 0 {
+            return;
+        }
+
+        let source = bus.read(base, AccessSize::Word);
+        let destination = bus.read(base + 4, AccessSize::Word);
+        let count = bus.read(base + 8, AccessSize::Halfword) as u16;
+        self.run_dma(channel, source, destination, count, control, bus);
+
+        if control & DMA_REPEAT == 0 {
+            bus.write(
+                base + 10,
+                AccessSize::Halfword,
+                u32::from(control & !DMA_ENABLE),
+            );
+        }
+    }
+
+    fn run_dma(
+        &mut self,
+        channel: usize,
+        mut source: u32,
+        mut destination: u32,
+        count: u16,
+        control: u16,
+        bus: &mut Bus<'_>,
+    ) {
+        let unit_size = if control & DMA_32BIT != 0 { 4 } else { 2 };
+        let count = if count == 0 {
+            if channel == 3 { 0x10000 } else { 0x4000 }
+        } else {
+            u32::from(count)
+        };
+        let source_step = dma_addr_step((control >> 7) & 0x3, unit_size);
+        let destination_step = dma_addr_step((control >> 5) & 0x3, unit_size);
+
+        for _ in 0..count {
+            if unit_size == 4 {
+                let low = self.dma_read_halfword(source, bus);
+                let high = self.dma_read_halfword(source.wrapping_add(2), bus);
+                self.dma_write_halfword(destination, low, bus);
+                self.dma_write_halfword(destination.wrapping_add(2), high, bus);
+            } else {
+                let value = self.dma_read_halfword(source, bus);
+                self.dma_write_halfword(destination, value, bus);
+            }
+            source = source.wrapping_add_signed(source_step);
+            destination = destination.wrapping_add_signed(destination_step);
+        }
+    }
+
+    fn dma_read_halfword(&self, addr: u32, bus: &mut Bus<'_>) -> u16 {
+        if (GAME_PAK_ROM_START..GAME_PAK_ROM_START + self.rom.len() as u32).contains(&addr) {
+            let offset = (addr - GAME_PAK_ROM_START) as usize;
+            if offset + 1 < self.rom.len() {
+                return u16::from_le_bytes([self.rom[offset], self.rom[offset + 1]]);
+            }
+            return 0xffff;
+        }
+        dma_memory_region(addr).map_or(0, |(region, offset)| {
+            bus.memory_mut().read_halfword(region, offset)
+        })
+    }
+
+    fn dma_write_halfword(&self, addr: u32, value: u16, bus: &mut Bus<'_>) {
+        if let Some((region, offset)) = dma_memory_region(addr) {
+            bus.memory_mut().write_halfword(region, offset, value);
+        }
+    }
+}
+
+fn dma_channel_for_cnt_high(addr: u32) -> Option<usize> {
+    if addr < DMA0CNT + 2 || addr > DMA0CNT + 2 + 3 * 12 {
+        return None;
+    }
+    let offset = addr - (DMA0CNT + 2);
+    if offset % 12 == 0 {
+        Some((offset / 12) as usize)
+    } else {
+        None
+    }
+}
+
+fn dma_addr_step(mode: u16, unit_size: i32) -> i32 {
+    match mode {
+        1 => -unit_size,
+        2 => 0,
+        _ => unit_size,
+    }
+}
+
+fn dma_memory_region(addr: u32) -> Option<(MemoryRegionKind, usize)> {
+    if (EWRAM_START..EWRAM_START + EWRAM_SIZE as u32).contains(&addr) {
+        Some((MemoryRegionKind::Ewram, (addr - EWRAM_START) as usize))
+    } else if (IWRAM_START..IWRAM_START + IWRAM_SIZE as u32).contains(&addr) {
+        Some((MemoryRegionKind::Iwram, (addr - IWRAM_START) as usize))
+    } else if (PALETTE_START..PALETTE_START + PALETTE_SIZE as u32).contains(&addr) {
+        Some((MemoryRegionKind::Palette, (addr - PALETTE_START) as usize))
+    } else if (VRAM_START..VRAM_START + VRAM_SIZE as u32).contains(&addr) {
+        Some((MemoryRegionKind::Vram, (addr - VRAM_START) as usize))
+    } else if (OAM_START..OAM_START + OAM_SIZE as u32).contains(&addr) {
+        Some((MemoryRegionKind::Oam, (addr - OAM_START) as usize))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gba::{
+        memory::GbaMemory,
+        memory_map::{DMA3CNT, DMA3DAD, DMA3SAD},
+    };
+
+    #[test]
+    fn immediate_dma3_copies_halfwords_from_rom_to_vram() {
+        let mut rom = vec![0; 0x200];
+        rom[0..4].copy_from_slice(&[0x1f, 0x00, 0xe0, 0x03]);
+        let cartridge = Cartridge::from_bytes(rom);
+        let mut runner = SoftwareRunner::new_for_rom(&cartridge);
+        let mut memory = GbaMemory::new();
+        let mut bus = Bus::new(&mut memory);
+
+        runner.write_data_u32(DMA3SAD, GAME_PAK_ROM_START, &mut bus);
+        runner.write_data_u32(DMA3DAD, VRAM_START, &mut bus);
+        runner.write_data_u32(DMA3CNT, (1 << 31) | 2, &mut bus);
+
+        assert_eq!(bus.memory_mut().vram()[0..4], [0x1f, 0x00, 0xe0, 0x03]);
+        assert_eq!(
+            bus.read(DMA3CNT + 2, AccessSize::Halfword) & u32::from(DMA_ENABLE),
+            0
+        );
     }
 }

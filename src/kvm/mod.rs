@@ -64,13 +64,8 @@ impl KvmGba {
         let mut slot_id = 0;
         let mut slots = Vec::new();
         let bios_slot = MemorySlot::anonymous(vm_fd.raw(), &mut slot_id, BIOS_START, BIOS_SIZE, 0)?;
-        slots.push(MemorySlot::anonymous(
-            vm_fd.raw(),
-            &mut slot_id,
-            EWRAM_START,
-            EWRAM_SIZE,
-            0,
-        )?);
+        let ewram_slot =
+            MemorySlot::anonymous(vm_fd.raw(), &mut slot_id, EWRAM_START, EWRAM_SIZE, 0)?;
         let iwram_slot =
             MemorySlot::anonymous(vm_fd.raw(), &mut slot_id, IWRAM_START, IWRAM_SIZE, 0)?;
         let io_slot = MemorySlot::anonymous(
@@ -100,13 +95,17 @@ impl KvmGba {
         install_cache_bootstrap(&bios_slot.region, &iwram_slot.region);
 
         let shared = Arc::new(KvmSharedMemory::new(
+            ewram_slot.region.clone_for_shared(),
+            iwram_slot.region.clone_for_shared(),
             io_slot.region.clone_for_shared(),
             palette_slot.region.clone_for_shared(),
             vram_slot.region.clone_for_shared(),
             oam_slot.region.clone_for_shared(),
+            cartridge.rom(),
         ));
         shared.write_io_u16(KEYINPUT, 0x03ff);
         slots.push(bios_slot);
+        slots.push(ewram_slot);
         slots.push(iwram_slot);
         slots.push(io_slot);
         slots.push(palette_slot);
@@ -202,6 +201,7 @@ impl KvmGba {
                 trace_io_mmio("write", addr, mmio.len, &mmio.data);
                 self.shared.mirror_io_write(addr, mmio.len, &mmio.data);
                 self.shared.write_timer_registers_from_io(addr, mmio.len);
+                self.shared.run_immediate_dma_for_io_write(addr, mmio.len);
             } else {
                 let len = mmio.len;
                 self.shared

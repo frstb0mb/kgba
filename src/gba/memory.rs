@@ -52,6 +52,10 @@ impl GbaMemory {
         self.oam.as_ref()
     }
 
+    pub fn oam_mut(&mut self) -> &mut [u8] {
+        self.oam.as_mut()
+    }
+
     pub fn write_vram_halfword(&mut self, byte_offset: usize, value: u16) {
         let bytes = value.to_le_bytes();
         self.vram[byte_offset] = bytes[0];
@@ -62,6 +66,14 @@ impl GbaMemory {
         let bytes = value.to_le_bytes();
         self.palette[byte_offset] = bytes[0];
         self.palette[byte_offset + 1] = bytes[1];
+    }
+
+    pub fn read_halfword(&self, region: MemoryRegionKind, byte_offset: usize) -> u16 {
+        read_u16(self.region(region), byte_offset)
+    }
+
+    pub fn write_halfword(&mut self, region: MemoryRegionKind, byte_offset: usize, value: u16) {
+        write_u16(self.region_mut(region), byte_offset, value);
     }
 
     pub fn read_ewram_word(&self, byte_offset: usize) -> u32 {
@@ -79,6 +91,45 @@ impl GbaMemory {
     pub fn write_iwram_word(&mut self, byte_offset: usize, value: u32) {
         write_u32(self.iwram.as_mut(), byte_offset, value);
     }
+
+    fn region(&self, region: MemoryRegionKind) -> &[u8] {
+        match region {
+            MemoryRegionKind::Ewram => self.ewram.as_ref(),
+            MemoryRegionKind::Iwram => self.iwram.as_ref(),
+            MemoryRegionKind::Palette => self.palette.as_ref(),
+            MemoryRegionKind::Vram => self.vram.as_ref(),
+            MemoryRegionKind::Oam => self.oam.as_ref(),
+        }
+    }
+
+    fn region_mut(&mut self, region: MemoryRegionKind) -> &mut [u8] {
+        match region {
+            MemoryRegionKind::Ewram => self.ewram.as_mut(),
+            MemoryRegionKind::Iwram => self.iwram.as_mut(),
+            MemoryRegionKind::Palette => self.palette.as_mut(),
+            MemoryRegionKind::Vram => self.vram.as_mut(),
+            MemoryRegionKind::Oam => self.oam.as_mut(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryRegionKind {
+    Ewram,
+    Iwram,
+    Palette,
+    Vram,
+    Oam,
+}
+
+fn read_u16(memory: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([memory[offset], memory[offset + 1]])
+}
+
+fn write_u16(memory: &mut [u8], offset: usize, value: u16) {
+    let bytes = value.to_le_bytes();
+    memory[offset] = bytes[0];
+    memory[offset + 1] = bytes[1];
 }
 
 fn read_u32(memory: &[u8], offset: usize) -> u32 {
