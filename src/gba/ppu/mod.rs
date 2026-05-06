@@ -5,9 +5,13 @@ pub const TOTAL_SCANLINES: u16 = 228;
 
 pub const MODE_3: u16 = 0x0003;
 pub const MODE_4: u16 = 0x0004;
+pub const MODE_5: u16 = 0x0005;
 pub const DISPCNT_MODE_MASK: u16 = 0x0007;
 pub const BACKBUFFER: u16 = 1 << 4;
 pub const BG2_ENABLE: u16 = 1 << 10;
+
+const MODE5_WIDTH: usize = 160;
+const MODE5_HEIGHT: usize = 128;
 
 const DISPSTAT_VBLANK: u16 = 1 << 0;
 const DISPSTAT_HBLANK: u16 = 1 << 1;
@@ -80,6 +84,7 @@ impl Ppu {
         match self.dispcnt & DISPCNT_MODE_MASK {
             MODE_3 => self.render_mode3(vram),
             MODE_4 => self.render_mode4(palette, vram),
+            MODE_5 => self.render_mode5(vram),
             _ => vec![0xff000000; WIDTH * HEIGHT],
         }
     }
@@ -121,6 +126,30 @@ impl Ppu {
                 let palette_offset = color_index * 2;
                 let color =
                     u16::from_le_bytes([palette[palette_offset], palette[palette_offset + 1]]);
+                frame[y * WIDTH + x] = bgr555_to_argb8888(color);
+            }
+        }
+
+        frame
+    }
+
+    pub fn render_mode5(&self, vram: &[u8]) -> FrameBuffer {
+        let mut frame = vec![0xff000000; WIDTH * HEIGHT];
+
+        if (self.dispcnt & DISPCNT_MODE_MASK) != MODE_5 || (self.dispcnt & BG2_ENABLE) == 0 {
+            return frame;
+        }
+
+        let page_offset = if self.dispcnt & BACKBUFFER != 0 {
+            0xA000
+        } else {
+            0
+        };
+
+        for y in 0..MODE5_HEIGHT {
+            for x in 0..MODE5_WIDTH {
+                let offset = page_offset + (y * MODE5_WIDTH + x) * 2;
+                let color = u16::from_le_bytes([vram[offset], vram[offset + 1]]);
                 frame[y * WIDTH + x] = bgr555_to_argb8888(color);
             }
         }
@@ -183,6 +212,21 @@ mod tests {
 
         ppu.write_dispcnt(MODE_4 | BG2_ENABLE | BACKBUFFER);
         assert_eq!(ppu.render_frame(&palette, &vram)[0], 0xff00ff00);
+    }
+
+    #[test]
+    fn mode5_uses_16bpp_pixels_and_selected_frame() {
+        let palette = vec![0; 0x400];
+        let mut vram = vec![0; 0x18000];
+        vram[0..2].copy_from_slice(&rgb5(31, 0, 0).to_le_bytes());
+        vram[0xA000..0xA002].copy_from_slice(&rgb5(0, 0, 31).to_le_bytes());
+
+        let mut ppu = Ppu::new();
+        ppu.write_dispcnt(MODE_5 | BG2_ENABLE);
+        assert_eq!(ppu.render_frame(&palette, &vram)[0], 0xffff0000);
+
+        ppu.write_dispcnt(MODE_5 | BG2_ENABLE | BACKBUFFER);
+        assert_eq!(ppu.render_frame(&palette, &vram)[0], 0xff0000ff);
     }
 
     #[test]
