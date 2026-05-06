@@ -61,7 +61,7 @@ impl<'a> Bus<'a> {
 
     pub fn render_frame_argb8888(&self) -> FrameBuffer {
         self.ppu
-            .render_frame(self.memory.palette(), self.memory.vram())
+            .render_frame(self.memory.palette(), self.memory.vram(), self.memory.oam())
     }
 
     fn read_byte(&mut self, addr: u32) -> u8 {

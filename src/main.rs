@@ -82,13 +82,18 @@ fn run_kvm(cartridge: &Cartridge, duration_ms: Option<u64>) -> Result<(), String
     if let Some(duration_ms) = duration_ms {
         let started = Instant::now();
         while started.elapsed() < Duration::from_millis(duration_ms) {
+            let (_, keyinput) = video.poll_events_and_input();
+            shared.set_keyinput(keyinput);
             video.present(&shared.render_frame())?;
         }
         stop.store(true, Ordering::Relaxed);
         return Ok(());
     }
 
-    let result = video.run_frame_loop(|_| shared.render_frame());
+    let result = video.run_frame_loop(
+        |_| shared.render_frame(),
+        |keyinput| shared.set_keyinput(keyinput),
+    );
     stop.store(true, Ordering::Relaxed);
     result
 }

@@ -64,6 +64,7 @@ pub struct KvmSharedMemory {
     io: MemoryRegion,
     palette: MemoryRegion,
     vram: MemoryRegion,
+    oam: MemoryRegion,
 }
 
 unsafe impl Send for KvmSharedMemory {}
@@ -74,10 +75,18 @@ impl KvmSharedMemory {
         self.write_io_u16(VCOUNT, value);
     }
 
+    pub fn set_keyinput(&self, value: u16) {
+        self.write_io_u16(IO_START + 0x0130, value);
+    }
+
     pub fn render_frame(&self) -> FrameBuffer {
         let mut ppu = Ppu::new();
         ppu.write_dispcnt(self.read_io_u16(DISPCNT));
-        ppu.render_frame(self.palette.as_slice(), self.vram.as_slice())
+        ppu.render_frame(
+            self.palette.as_slice(),
+            self.vram.as_slice(),
+            self.oam.as_slice(),
+        )
     }
 
     fn read_io_u16(&self, addr: u32) -> u16 {
@@ -156,13 +165,8 @@ impl KvmGba {
             0,
         )?;
         let vram_slot = MemorySlot::anonymous(vm_fd.raw(), &mut slot_id, VRAM_START, VRAM_SIZE, 0)?;
-        slots.push(MemorySlot::anonymous(
-            vm_fd.raw(),
-            &mut slot_id,
-            OAM_START,
-            OAM_SLOT_SIZE,
-            0,
-        )?);
+        let oam_slot =
+            MemorySlot::anonymous(vm_fd.raw(), &mut slot_id, OAM_START, OAM_SLOT_SIZE, 0)?;
         slots.push(MemorySlot::rom(
             vm_fd.raw(),
             &mut slot_id,
@@ -176,12 +180,15 @@ impl KvmGba {
             io: io_slot.region.clone_for_shared(),
             palette: palette_slot.region.clone_for_shared(),
             vram: vram_slot.region.clone_for_shared(),
+            oam: oam_slot.region.clone_for_shared(),
         });
+        shared.write_io_u16(IO_START + 0x0130, 0x03ff);
         slots.push(bios_slot);
         slots.push(iwram_slot);
         slots.push(io_slot);
         slots.push(palette_slot);
         slots.push(vram_slot);
+        slots.push(oam_slot);
 
         let vcpu_raw = unsafe { sys::ioctl_arg(vm_fd.raw(), sys::KVM_CREATE_VCPU, 0) };
         if vcpu_raw < 0 {

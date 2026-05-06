@@ -3,15 +3,21 @@ pub const HEIGHT: usize = 160;
 pub const VISIBLE_SCANLINES: u16 = 160;
 pub const TOTAL_SCANLINES: u16 = 228;
 
+pub const MODE_0: u16 = 0x0000;
 pub const MODE_3: u16 = 0x0003;
 pub const MODE_4: u16 = 0x0004;
 pub const MODE_5: u16 = 0x0005;
 pub const DISPCNT_MODE_MASK: u16 = 0x0007;
 pub const BACKBUFFER: u16 = 1 << 4;
+pub const OBJ_1D_MAPPING: u16 = 1 << 6;
 pub const BG2_ENABLE: u16 = 1 << 10;
+pub const OBJ_ENABLE: u16 = 1 << 12;
 
 const MODE5_WIDTH: usize = 160;
 const MODE5_HEIGHT: usize = 128;
+const OBJ_TILE_BASE_TEXT_MODE: usize = 0x10000;
+const OBJ_TILE_BASE_BITMAP_MODE: usize = 0x14000;
+const OBJ_PALETTE_BASE: usize = 0x200;
 
 const DISPSTAT_VBLANK: u16 = 1 << 0;
 const DISPSTAT_HBLANK: u16 = 1 << 1;
@@ -80,13 +86,20 @@ impl Ppu {
         }
     }
 
-    pub fn render_frame(&self, palette: &[u8], vram: &[u8]) -> FrameBuffer {
-        match self.dispcnt & DISPCNT_MODE_MASK {
+    pub fn render_frame(&self, palette: &[u8], vram: &[u8], oam: &[u8]) -> FrameBuffer {
+        let mut frame = match self.dispcnt & DISPCNT_MODE_MASK {
+            MODE_0 => vec![0xff000000; WIDTH * HEIGHT],
             MODE_3 => self.render_mode3(vram),
             MODE_4 => self.render_mode4(palette, vram),
             MODE_5 => self.render_mode5(vram),
             _ => vec![0xff000000; WIDTH * HEIGHT],
+        };
+
+        if self.dispcnt & OBJ_ENABLE != 0 {
+            self.render_objs(palette, vram, oam, &mut frame);
         }
+
+        frame
     }
 
     pub fn render_mode3(&self, vram: &[u8]) -> FrameBuffer {
@@ -156,6 +169,150 @@ impl Ppu {
 
         frame
     }
+
+    fn render_objs(&self, palette: &[u8], vram: &[u8], oam: &[u8], frame: &mut [u32]) {
+        let mut objs = Vec::with_capacity(128);
+        for obj_index in 0..128 {
+            let offset = obj_index * 8;
+            let attr0 = read_u16(oam, offset);
+            let attr1 = read_u16(oam, offset + 2);
+            let attr2 = read_u16(oam, offset + 4);
+
+            if attr0 & (1 << 9) != 0 {
+                continue;
+            }
+            if ((attr0 >> 10) & 0x3) != 0 {
+                continue;
+            }
+            if attr0 & (1 << 13) != 0 {
+                continue;
+            }
+
+            objs.push(Obj {
+                index: obj_index,
+                attr0,
+                attr1,
+                attr2,
+            });
+        }
+
+        objs.sort_by_key(|obj| {
+            (
+                std::cmp::Reverse(obj.priority()),
+                std::cmp::Reverse(obj.index),
+            )
+        });
+
+        for obj in objs {
+            let attr0 = obj.attr0;
+            let attr1 = obj.attr1;
+            let attr2 = obj.attr2;
+            let (obj_width, obj_height) = obj_size(attr0, attr1);
+            let obj_x = sign_extend(attr1 & 0x01ff, 9);
+            let obj_y = sign_extend(attr0 & 0x00ff, 8);
+            let tile_base = usize::from(attr2 & 0x03ff);
+            let palette_bank = usize::from((attr2 >> 12) & 0x0f);
+            let tile_memory_base = self.obj_tile_memory_base();
+            let one_dimensional = self.dispcnt & OBJ_1D_MAPPING != 0;
+            let row_stride = if one_dimensional { obj_width / 8 } else { 32 };
+
+            for y in 0..obj_height {
+                let screen_y = obj_y + y as i32;
+                if !(0..HEIGHT as i32).contains(&screen_y) {
+                    continue;
+                }
+
+                for x in 0..obj_width {
+                    let screen_x = obj_x + x as i32;
+                    if !(0..WIDTH as i32).contains(&screen_x) {
+                        continue;
+                    }
+
+                    let tile_x = x / 8;
+                    let tile_y = y / 8;
+                    let tile_number = tile_base + tile_y * row_stride + tile_x;
+                    let pixel_in_tile = (y % 8) * 8 + (x % 8);
+                    let color_index =
+                        obj_4bpp_color(vram, tile_memory_base, tile_number, pixel_in_tile);
+                    if color_index == 0 {
+                        continue;
+                    }
+
+                    let palette_index =
+                        OBJ_PALETTE_BASE + (palette_bank * 16 + usize::from(color_index)) * 2;
+                    let color =
+                        u16::from_le_bytes([palette[palette_index], palette[palette_index + 1]]);
+                    frame[screen_y as usize * WIDTH + screen_x as usize] =
+                        bgr555_to_argb8888(color);
+                }
+            }
+        }
+    }
+
+    fn obj_tile_memory_base(&self) -> usize {
+        match self.dispcnt & DISPCNT_MODE_MASK {
+            MODE_0..=0x0002 => OBJ_TILE_BASE_TEXT_MODE,
+            _ => OBJ_TILE_BASE_BITMAP_MODE,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Obj {
+    index: usize,
+    attr0: u16,
+    attr1: u16,
+    attr2: u16,
+}
+
+impl Obj {
+    fn priority(self) -> u16 {
+        (self.attr2 >> 10) & 0x3
+    }
+}
+
+fn obj_4bpp_color(vram: &[u8], base: usize, tile_number: usize, pixel_in_tile: usize) -> u8 {
+    let tile_offset = base + tile_number * 32;
+    if tile_offset + 31 >= vram.len() {
+        return 0;
+    }
+    let color_byte = vram[tile_offset + pixel_in_tile / 2];
+    if pixel_in_tile & 1 == 0 {
+        color_byte & 0x0f
+    } else {
+        color_byte >> 4
+    }
+}
+
+fn read_u16(memory: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([memory[offset], memory[offset + 1]])
+}
+
+fn sign_extend(value: u16, bits: u32) -> i32 {
+    let sign_bit = 1u16 << (bits - 1);
+    if value & sign_bit != 0 {
+        i32::from(value) - (1 << bits)
+    } else {
+        i32::from(value)
+    }
+}
+
+fn obj_size(attr0: u16, attr1: u16) -> (usize, usize) {
+    match ((attr0 >> 14) & 0x3, (attr1 >> 14) & 0x3) {
+        (0, 0) => (8, 8),
+        (0, 1) => (16, 16),
+        (0, 2) => (32, 32),
+        (0, 3) => (64, 64),
+        (1, 0) => (16, 8),
+        (1, 1) => (32, 8),
+        (1, 2) => (32, 16),
+        (1, 3) => (64, 32),
+        (2, 0) => (8, 16),
+        (2, 1) => (8, 32),
+        (2, 2) => (16, 32),
+        (2, 3) => (32, 64),
+        _ => (8, 8),
+    }
 }
 
 pub fn bgr555_to_argb8888(color: u16) -> u32 {
@@ -208,10 +365,11 @@ mod tests {
 
         let mut ppu = Ppu::new();
         ppu.write_dispcnt(MODE_4 | BG2_ENABLE);
-        assert_eq!(ppu.render_frame(&palette, &vram)[0], 0xffff0000);
+        let oam = vec![0; 0x400];
+        assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], 0xffff0000);
 
         ppu.write_dispcnt(MODE_4 | BG2_ENABLE | BACKBUFFER);
-        assert_eq!(ppu.render_frame(&palette, &vram)[0], 0xff00ff00);
+        assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], 0xff00ff00);
     }
 
     #[test]
@@ -223,10 +381,106 @@ mod tests {
 
         let mut ppu = Ppu::new();
         ppu.write_dispcnt(MODE_5 | BG2_ENABLE);
-        assert_eq!(ppu.render_frame(&palette, &vram)[0], 0xffff0000);
+        let oam = vec![0; 0x400];
+        assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], 0xffff0000);
 
         ppu.write_dispcnt(MODE_5 | BG2_ENABLE | BACKBUFFER);
-        assert_eq!(ppu.render_frame(&palette, &vram)[0], 0xff0000ff);
+        assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], 0xff0000ff);
+    }
+
+    #[test]
+    fn mode0_renders_4bpp_square_obj() {
+        let mut palette = vec![0; 0x400];
+        palette[OBJ_PALETTE_BASE + 2..OBJ_PALETTE_BASE + 4]
+            .copy_from_slice(&rgb5(31, 31, 31).to_le_bytes());
+
+        let mut vram = vec![0; 0x18000];
+        vram[OBJ_TILE_BASE_TEXT_MODE + 32] = 0x11;
+
+        let mut oam = vec![0; 0x400];
+        write_oam_halfword(&mut oam, 0, 0);
+        write_oam_halfword(&mut oam, 2, 0);
+        write_oam_halfword(&mut oam, 4, 1);
+
+        let mut ppu = Ppu::new();
+        ppu.write_dispcnt(MODE_0 | OBJ_ENABLE);
+        let frame = ppu.render_frame(&palette, &vram, &oam);
+
+        assert_eq!(frame[0], 0xffffffff);
+        assert_eq!(frame[2], 0xff000000);
+    }
+
+    #[test]
+    fn attr2_palette_bank_selects_obj_palette_row() {
+        let mut palette = vec![0; 0x400];
+        palette[OBJ_PALETTE_BASE + 2..OBJ_PALETTE_BASE + 4]
+            .copy_from_slice(&rgb5(31, 0, 0).to_le_bytes());
+        palette[OBJ_PALETTE_BASE + 16 * 2 + 2..OBJ_PALETTE_BASE + 16 * 2 + 4]
+            .copy_from_slice(&rgb5(0, 31, 0).to_le_bytes());
+
+        let mut vram = vec![0; 0x18000];
+        vram[OBJ_TILE_BASE_TEXT_MODE] = 0x11;
+
+        let mut oam = vec![0; 0x400];
+        write_oam_halfword(&mut oam, 0, 0);
+        write_oam_halfword(&mut oam, 2, 0);
+        write_oam_halfword(&mut oam, 4, 1 << 12);
+
+        let mut ppu = Ppu::new();
+        ppu.write_dispcnt(MODE_0 | OBJ_ENABLE | OBJ_1D_MAPPING);
+        let frame = ppu.render_frame(&palette, &vram, &oam);
+
+        assert_eq!(frame[0], 0xff00ff00);
+    }
+
+    #[test]
+    fn attr2_priority_and_oam_index_control_obj_order() {
+        let mut palette = vec![0; 0x400];
+        palette[OBJ_PALETTE_BASE + 2..OBJ_PALETTE_BASE + 4]
+            .copy_from_slice(&rgb5(31, 0, 0).to_le_bytes());
+        palette[OBJ_PALETTE_BASE + 4..OBJ_PALETTE_BASE + 6]
+            .copy_from_slice(&rgb5(0, 31, 0).to_le_bytes());
+
+        let mut vram = vec![0; 0x18000];
+        vram[OBJ_TILE_BASE_TEXT_MODE] = 0x11;
+        vram[OBJ_TILE_BASE_TEXT_MODE + 32] = 0x22;
+
+        let mut oam = vec![0; 0x400];
+        write_oam_halfword(&mut oam, 0, 0);
+        write_oam_halfword(&mut oam, 2, 0);
+        write_oam_halfword(&mut oam, 4, 0 | (1 << 10));
+        write_oam_halfword(&mut oam, 8, 0);
+        write_oam_halfword(&mut oam, 10, 0);
+        write_oam_halfword(&mut oam, 12, 1);
+
+        let mut ppu = Ppu::new();
+        ppu.write_dispcnt(MODE_0 | OBJ_ENABLE | OBJ_1D_MAPPING);
+        assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], 0xff00ff00);
+
+        write_oam_halfword(&mut oam, 4, 0);
+        write_oam_halfword(&mut oam, 12, 1);
+        assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], 0xffff0000);
+    }
+
+    #[test]
+    fn obj_1d_mapping_uses_compact_rows() {
+        let mut palette = vec![0; 0x400];
+        palette[OBJ_PALETTE_BASE + 2..OBJ_PALETTE_BASE + 4]
+            .copy_from_slice(&rgb5(31, 31, 31).to_le_bytes());
+
+        let mut vram = vec![0; 0x18000];
+        vram[OBJ_TILE_BASE_TEXT_MODE + 9 * 32] = 0x11;
+
+        let mut oam = vec![0; 0x400];
+        write_oam_halfword(&mut oam, 0, 0);
+        write_oam_halfword(&mut oam, 2, 3 << 14);
+        write_oam_halfword(&mut oam, 4, 1);
+
+        let mut ppu = Ppu::new();
+        ppu.write_dispcnt(MODE_0 | OBJ_ENABLE | OBJ_1D_MAPPING);
+        let frame = ppu.render_frame(&palette, &vram, &oam);
+
+        assert_eq!(frame[WIDTH * 8], 0xffffffff);
     }
 
     #[test]
@@ -286,5 +540,11 @@ mod tests {
 
     fn rgb5(r: u16, g: u16, b: u16) -> u16 {
         (r & 0x1f) | ((g & 0x1f) << 5) | ((b & 0x1f) << 10)
+    }
+
+    fn write_oam_halfword(oam: &mut [u8], offset: usize, value: u16) {
+        let bytes = value.to_le_bytes();
+        oam[offset] = bytes[0];
+        oam[offset + 1] = bytes[1];
     }
 }

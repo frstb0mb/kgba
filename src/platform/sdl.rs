@@ -15,6 +15,29 @@ const SDL_TEXTUREACCESS_STREAMING: c_int = 1;
 const SDL_PIXELFORMAT_ARGB8888: u32 = 372645892;
 const SDL_QUIT: u32 = 0x100;
 
+const SDL_SCANCODE_A: usize = 4;
+const SDL_SCANCODE_D: usize = 7;
+const SDL_SCANCODE_I: usize = 12;
+const SDL_SCANCODE_K: usize = 14;
+const SDL_SCANCODE_L: usize = 15;
+const SDL_SCANCODE_O: usize = 18;
+const SDL_SCANCODE_S: usize = 22;
+const SDL_SCANCODE_W: usize = 26;
+const SDL_SCANCODE_RETURN: usize = 40;
+const SDL_SCANCODE_BACKSPACE: usize = 42;
+
+const KEY_A: u16 = 1 << 0;
+const KEY_B: u16 = 1 << 1;
+const KEY_SELECT: u16 = 1 << 2;
+const KEY_START: u16 = 1 << 3;
+const KEY_RIGHT: u16 = 1 << 4;
+const KEY_LEFT: u16 = 1 << 5;
+const KEY_UP: u16 = 1 << 6;
+const KEY_DOWN: u16 = 1 << 7;
+const KEY_R: u16 = 1 << 8;
+const KEY_L: u16 = 1 << 9;
+const KEYINPUT_RELEASED: u16 = 0x03ff;
+
 #[repr(C)]
 struct SDL_Window(c_void);
 #[repr(C)]
@@ -69,6 +92,8 @@ unsafe extern "C" {
     ) -> c_int;
     fn SDL_RenderPresent(renderer: *mut SDL_Renderer);
     fn SDL_PollEvent(event: *mut SDL_Event) -> c_int;
+    fn SDL_PumpEvents();
+    fn SDL_GetKeyboardState(numkeys: *mut c_int) -> *const u8;
 }
 
 pub struct Video {
@@ -161,34 +186,48 @@ impl Video {
         }
     }
 
-    pub fn run_frame_loop<F>(&mut self, mut next_frame: F) -> Result<(), String>
+    pub fn run_frame_loop<F, I>(
+        &mut self,
+        mut next_frame: F,
+        mut publish_input: I,
+    ) -> Result<(), String>
     where
         F: FnMut(u16) -> Vec<u32>,
+        I: FnMut(u16),
     {
         let mut vcount = 0u16;
         loop {
-            let frame = next_frame(vcount);
-            self.present(&frame)?;
-            if self.poll_quit() {
+            let (quit, keyinput) = self.poll_events_and_input();
+            publish_input(keyinput);
+            if quit {
                 return Ok(());
             }
+
+            let frame = next_frame(vcount);
+            self.present(&frame)?;
             vcount = if vcount + 1 >= 228 { 0 } else { vcount + 1 };
         }
     }
 
     fn poll_quit(&mut self) -> bool {
+        self.poll_events_and_input().0
+    }
+
+    pub fn poll_events_and_input(&mut self) -> (bool, u16) {
         unsafe {
             let mut event = SDL_Event {
                 type_: 0,
                 padding: [0; 52],
             };
+            let mut quit = false;
             while SDL_PollEvent(&mut event) != 0 {
                 if event.type_ == SDL_QUIT {
-                    return true;
+                    quit = true;
                 }
             }
+            SDL_PumpEvents();
+            (quit, read_keyinput())
         }
-        false
     }
 }
 
@@ -200,6 +239,36 @@ impl Drop for Video {
             SDL_DestroyWindow(self.window);
             SDL_Quit();
         }
+    }
+}
+
+fn read_keyinput() -> u16 {
+    let mut numkeys = 0;
+    let state = unsafe { SDL_GetKeyboardState(&mut numkeys) };
+    if state.is_null() {
+        return KEYINPUT_RELEASED;
+    }
+
+    let keys = unsafe { std::slice::from_raw_parts(state, numkeys as usize) };
+    let mut keyinput = KEYINPUT_RELEASED;
+
+    clear_if_pressed(keys, SDL_SCANCODE_L, &mut keyinput, KEY_A);
+    clear_if_pressed(keys, SDL_SCANCODE_K, &mut keyinput, KEY_B);
+    clear_if_pressed(keys, SDL_SCANCODE_BACKSPACE, &mut keyinput, KEY_SELECT);
+    clear_if_pressed(keys, SDL_SCANCODE_RETURN, &mut keyinput, KEY_START);
+    clear_if_pressed(keys, SDL_SCANCODE_D, &mut keyinput, KEY_RIGHT);
+    clear_if_pressed(keys, SDL_SCANCODE_A, &mut keyinput, KEY_LEFT);
+    clear_if_pressed(keys, SDL_SCANCODE_W, &mut keyinput, KEY_UP);
+    clear_if_pressed(keys, SDL_SCANCODE_S, &mut keyinput, KEY_DOWN);
+    clear_if_pressed(keys, SDL_SCANCODE_O, &mut keyinput, KEY_R);
+    clear_if_pressed(keys, SDL_SCANCODE_I, &mut keyinput, KEY_L);
+
+    keyinput
+}
+
+fn clear_if_pressed(keys: &[u8], scancode: usize, keyinput: &mut u16, bit: u16) {
+    if keys.get(scancode).copied().unwrap_or(0) != 0 {
+        *keyinput &= !bit;
     }
 }
 
