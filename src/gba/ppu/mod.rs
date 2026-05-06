@@ -563,6 +563,29 @@ mod tests {
     }
 
     #[test]
+    fn mode0_composes_bg0_over_bg1_with_4bpp_palette_banks() {
+        let mut palette = vec![0; 0x400];
+        palette[2..4].copy_from_slice(&rgb5(31, 0, 0).to_le_bytes());
+        palette[16 * 2 + 2..16 * 2 + 4].copy_from_slice(&rgb5(0, 31, 0).to_le_bytes());
+
+        let mut vram = vec![0; 0x18000];
+        vram[0] = 0x10;
+        vram[2 * CHAR_BLOCK_SIZE] = 0x11;
+        write_vram_halfword_offset(&mut vram, 11 * SCREEN_BLOCK_SIZE, 0);
+        write_vram_halfword_offset(&mut vram, 12 * SCREEN_BLOCK_SIZE, 1 << 12);
+
+        let mut ppu = Ppu::new();
+        ppu.write_dispcnt(MODE_0 | BG0_ENABLE | BG1_ENABLE);
+        ppu.write_bgcnt(0, 11 << 8);
+        ppu.write_bgcnt(1, (2 << 2) | (12 << 8));
+
+        let frame = ppu.render_mode0(&palette, &vram);
+
+        assert_eq!(frame[0], 0xff00ff00);
+        assert_eq!(frame[1], 0xffff0000);
+    }
+
+    #[test]
     fn mode0_renders_4bpp_square_obj() {
         let mut palette = vec![0; 0x400];
         palette[OBJ_PALETTE_BASE + 2..OBJ_PALETTE_BASE + 4]
