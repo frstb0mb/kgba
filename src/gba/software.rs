@@ -1,3 +1,11 @@
+//! Development-only software runner.
+//!
+//! This module is not part of the normal execution path. It is used only when
+//! the CLI is started with `--software`, so host-side tests can exercise ROM
+//! setup and PPU output on machines where the Raspberry Pi 4 KVM path is not
+//! available. The production goal remains native ARM/Thumb execution through
+//! KVM, with Rust handling GBA devices and MMIO.
+
 use super::{
     bus::{AccessSize, Bus},
     cartridge::Cartridge,

@@ -19,6 +19,13 @@ use kgba::{
     platform::sdl::Video,
 };
 
+const USAGE: &str = "\
+usage: kgba [--duration-ms N] [--headless] <rom.gba>
+       kgba --software [--duration-ms N] [--headless] <rom.gba>
+
+Default execution uses the KVM backend. The software runner is a development
+fallback and is enabled only when --software is explicitly passed.";
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("kgba: {err}");
@@ -33,7 +40,10 @@ fn run() -> Result<(), String> {
     let mut rom_path = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--headless" {
+        if arg == "--help" || arg == "-h" {
+            println!("{USAGE}");
+            return Ok(());
+        } else if arg == "--headless" {
             headless = true;
         } else if arg == "--software" {
             software = true;
@@ -50,9 +60,7 @@ fn run() -> Result<(), String> {
             rom_path = Some(arg);
         }
     }
-    let rom_path = rom_path.ok_or_else(|| {
-        "usage: kgba [--duration-ms N] [--software] [--headless] <rom.gba>".to_owned()
-    })?;
+    let rom_path = rom_path.ok_or_else(|| USAGE.to_owned())?;
     let cartridge = Cartridge::load(&rom_path).map_err(|err| format!("{rom_path}: {err}"))?;
 
     if software {
