@@ -104,6 +104,7 @@ fn run_vcount_clock(shared: Arc<kgba::kvm::KvmSharedMemory>, stop: Arc<AtomicBoo
     let mut next_tick = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         shared.set_vcount(vcount);
+        shared.tick_scanline();
         vcount += 1;
         if vcount >= TOTAL_SCANLINES {
             vcount = 0;
