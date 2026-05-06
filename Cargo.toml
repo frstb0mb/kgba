@@ -3,4 +3,8 @@ name = "kgba"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["kgba-bios"]
+
 [dependencies]
+kgba-bios = { path = "kgba-bios" }

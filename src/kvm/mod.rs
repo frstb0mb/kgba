@@ -23,7 +23,7 @@ use crate::gba::{
 };
 
 use self::{
-    bootstrap::install_cache_bootstrap, fd::Fd, memory::MemorySlot, regs::set_one_reg_u64,
+    bootstrap::install_bios_and_cache_bootstrap, fd::Fd, memory::MemorySlot, regs::set_one_reg_u64,
     run::RunMapping, trace::trace_io_mmio, util::last_os_error,
 };
 
@@ -92,7 +92,7 @@ impl KvmGba {
             cartridge.rom(),
         )?);
 
-        install_cache_bootstrap(&bios_slot.region, &iwram_slot.region);
+        install_bios_and_cache_bootstrap(&bios_slot.region, &iwram_slot.region);
 
         let shared = Arc::new(KvmSharedMemory::new(
             ewram_slot.region.clone_for_shared(),

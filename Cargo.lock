@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "kgba"
 version = "0.1.0"
+dependencies = [
+ "kgba-bios",
+]
+
+[[package]]
+name = "kgba-bios"
+version = "0.1.0"
