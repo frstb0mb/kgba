@@ -4,7 +4,9 @@ pub const VISIBLE_SCANLINES: u16 = 160;
 pub const TOTAL_SCANLINES: u16 = 228;
 
 pub const MODE_3: u16 = 0x0003;
+pub const MODE_4: u16 = 0x0004;
 pub const DISPCNT_MODE_MASK: u16 = 0x0007;
+pub const BACKBUFFER: u16 = 1 << 4;
 pub const BG2_ENABLE: u16 = 1 << 10;
 
 const DISPSTAT_VBLANK: u16 = 1 << 0;
@@ -74,6 +76,14 @@ impl Ppu {
         }
     }
 
+    pub fn render_frame(&self, palette: &[u8], vram: &[u8]) -> FrameBuffer {
+        match self.dispcnt & DISPCNT_MODE_MASK {
+            MODE_3 => self.render_mode3(vram),
+            MODE_4 => self.render_mode4(palette, vram),
+            _ => vec![0xff000000; WIDTH * HEIGHT],
+        }
+    }
+
     pub fn render_mode3(&self, vram: &[u8]) -> FrameBuffer {
         let mut frame = vec![0xff000000; WIDTH * HEIGHT];
 
@@ -85,6 +95,32 @@ impl Ppu {
             for x in 0..WIDTH {
                 let offset = (y * WIDTH + x) * 2;
                 let color = u16::from_le_bytes([vram[offset], vram[offset + 1]]);
+                frame[y * WIDTH + x] = bgr555_to_argb8888(color);
+            }
+        }
+
+        frame
+    }
+
+    pub fn render_mode4(&self, palette: &[u8], vram: &[u8]) -> FrameBuffer {
+        let mut frame = vec![0xff000000; WIDTH * HEIGHT];
+
+        if (self.dispcnt & DISPCNT_MODE_MASK) != MODE_4 || (self.dispcnt & BG2_ENABLE) == 0 {
+            return frame;
+        }
+
+        let page_offset = if self.dispcnt & BACKBUFFER != 0 {
+            0xA000
+        } else {
+            0
+        };
+
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let color_index = usize::from(vram[page_offset + y * WIDTH + x]);
+                let palette_offset = color_index * 2;
+                let color =
+                    u16::from_le_bytes([palette[palette_offset], palette[palette_offset + 1]]);
                 frame[y * WIDTH + x] = bgr555_to_argb8888(color);
             }
         }
@@ -129,6 +165,24 @@ mod tests {
 
         assert_eq!(frame[0], 0xffff0000);
         assert_eq!(frame[1], 0xff000000);
+    }
+
+    #[test]
+    fn mode4_uses_palette_and_selected_frame() {
+        let mut palette = vec![0; 0x400];
+        palette[2..4].copy_from_slice(&rgb5(31, 0, 0).to_le_bytes());
+        palette[4..6].copy_from_slice(&rgb5(0, 31, 0).to_le_bytes());
+
+        let mut vram = vec![0; 0x18000];
+        vram[0] = 1;
+        vram[0xA000] = 2;
+
+        let mut ppu = Ppu::new();
+        ppu.write_dispcnt(MODE_4 | BG2_ENABLE);
+        assert_eq!(ppu.render_frame(&palette, &vram)[0], 0xffff0000);
+
+        ppu.write_dispcnt(MODE_4 | BG2_ENABLE | BACKBUFFER);
+        assert_eq!(ppu.render_frame(&palette, &vram)[0], 0xff00ff00);
     }
 
     #[test]

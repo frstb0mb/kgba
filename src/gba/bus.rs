@@ -60,7 +60,8 @@ impl<'a> Bus<'a> {
     }
 
     pub fn render_frame_argb8888(&self) -> FrameBuffer {
-        self.ppu.render_mode3(self.memory.vram())
+        self.ppu
+            .render_frame(self.memory.palette(), self.memory.vram())
     }
 
     fn read_byte(&mut self, addr: u32) -> u8 {
