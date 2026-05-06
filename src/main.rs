@@ -12,6 +12,7 @@ use kgba::{
         bus::Bus,
         cartridge::Cartridge,
         memory::GbaMemory,
+        ppu::TOTAL_SCANLINES,
         software::{RunResult, SoftwareRunner},
     },
     kvm::KvmGba,
@@ -49,7 +50,9 @@ fn run() -> Result<(), String> {
             rom_path = Some(arg);
         }
     }
-    let rom_path = rom_path.unwrap_or_else(|| "roms/02.gba".to_owned());
+    let rom_path = rom_path.ok_or_else(|| {
+        "usage: kgba [--duration-ms N] [--software] [--headless] <rom.gba>".to_owned()
+    })?;
     let cartridge = Cartridge::load(&rom_path).map_err(|err| format!("{rom_path}: {err}"))?;
 
     if software {
@@ -64,6 +67,8 @@ fn run_kvm(cartridge: &Cartridge, duration_ms: Option<u64>) -> Result<(), String
     let shared = machine.shared_memory();
     let stop = Arc::new(AtomicBool::new(false));
     let kvm_stop = Arc::clone(&stop);
+    let vcount_stop = Arc::clone(&stop);
+    let vcount_memory = Arc::clone(&shared);
 
     std::thread::spawn(move || {
         if let Err(err) = machine.run(kvm_stop) {
@@ -71,24 +76,38 @@ fn run_kvm(cartridge: &Cartridge, duration_ms: Option<u64>) -> Result<(), String
         }
     });
 
+    std::thread::spawn(move || run_vcount_clock(vcount_memory, vcount_stop));
+
     let mut video = Video::new("kgba - KVM mode 3")?;
     if let Some(duration_ms) = duration_ms {
         let started = Instant::now();
-        let mut vcount = 0u16;
         while started.elapsed() < Duration::from_millis(duration_ms) {
-            shared.set_vcount(if vcount < 160 { vcount } else { 160 });
             video.present(&shared.render_mode3())?;
-            vcount = if vcount + 1 >= 228 { 0 } else { vcount + 1 };
-            std::thread::sleep(Duration::from_millis(16));
         }
         stop.store(true, Ordering::Relaxed);
         return Ok(());
     }
 
-    video.run_frame_loop(|vcount| {
-        shared.set_vcount(if vcount < 160 { vcount } else { 160 });
-        shared.render_mode3()
-    })
+    let result = video.run_frame_loop(|_| shared.render_mode3());
+    stop.store(true, Ordering::Relaxed);
+    result
+}
+
+fn run_vcount_clock(shared: Arc<kgba::kvm::KvmSharedMemory>, stop: Arc<AtomicBool>) {
+    let scanline = Duration::from_nanos(73_433);
+    let mut vcount = 0u16;
+    let mut next_tick = Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        shared.set_vcount(vcount);
+        vcount += 1;
+        if vcount >= TOTAL_SCANLINES {
+            vcount = 0;
+        }
+        next_tick += scanline;
+        while Instant::now() < next_tick {
+            std::hint::spin_loop();
+        }
+    }
 }
 
 fn run_software(

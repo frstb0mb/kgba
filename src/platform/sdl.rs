@@ -173,7 +173,6 @@ impl Video {
                 return Ok(());
             }
             vcount = if vcount + 1 >= 228 { 0 } else { vcount + 1 };
-            std::thread::sleep(Duration::from_millis(16));
         }
     }
 

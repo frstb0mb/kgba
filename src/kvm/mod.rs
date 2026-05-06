@@ -21,6 +21,43 @@ use crate::gba::{
 const IO_SLOT_SIZE: usize = 0x1000;
 const PALETTE_SLOT_SIZE: usize = 0x1000;
 const OAM_SLOT_SIZE: usize = 0x1000;
+const PAGE_TABLE_GUEST_ADDR: u32 = IWRAM_START + 0x4000;
+const PAGE_TABLE_IWRAM_OFFSET: usize = 0x4000;
+const SECTION_SIZE: u32 = 0x0010_0000;
+const TTBR0_INNER_SHAREABLE_WBWA: u32 = (1 << 6) | (1 << 3) | (1 << 1);
+const TTBR0_VALUE: u32 = PAGE_TABLE_GUEST_ADDR | TTBR0_INNER_SHAREABLE_WBWA;
+
+const SECTION_DESCRIPTOR: u32 = 0b10;
+const SECTION_BUFFERABLE: u32 = 1 << 2;
+const SECTION_CACHEABLE: u32 = 1 << 3;
+const SECTION_AP_FULL_ACCESS: u32 = 0b11 << 10;
+const SECTION_TEX_WRITE_BACK_WRITE_ALLOCATE: u32 = 0b001 << 12;
+const SECTION_SHAREABLE: u32 = 1 << 16;
+
+const NORMAL_SHARED_WBWA_SECTION: u32 = SECTION_DESCRIPTOR
+    | SECTION_BUFFERABLE
+    | SECTION_CACHEABLE
+    | SECTION_AP_FULL_ACCESS
+    | SECTION_TEX_WRITE_BACK_WRITE_ALLOCATE
+    | SECTION_SHAREABLE;
+
+const CACHE_BOOTSTRAP: [u32; 15] = [
+    0xe59f_0028, // ldr r0, [pc, #0x28] ; TTBR0
+    0xee02_0f10, // mcr p15, 0, r0, c2, c0, 0
+    0xe3e0_0000, // mvn r0, #0 ; DACR all manager
+    0xee03_0f10, // mcr p15, 0, r0, c3, c0, 0
+    0xee11_0f10, // mrc p15, 0, r0, c1, c0, 0 ; SCTLR
+    0xe59f_1018, // ldr r1, [pc, #0x18] ; M | C | I
+    0xe180_0001, // orr r0, r0, r1
+    0xee01_0f10, // mcr p15, 0, r0, c1, c0, 0
+    0xf57f_f04f, // dsb sy
+    0xf57f_f06f, // isb sy
+    0xe59f_0008, // ldr r0, [pc, #0x08] ; ROM entry
+    0xe12f_ff10, // bx r0
+    TTBR0_VALUE,
+    0x0000_1005, // SCTLR.M | SCTLR.C | SCTLR.I
+    GAME_PAK_ROM_START,
+];
 
 #[derive(Debug)]
 pub struct KvmSharedMemory {
@@ -93,13 +130,7 @@ impl KvmGba {
 
         let mut slot_id = 0;
         let mut slots = Vec::new();
-        slots.push(MemorySlot::anonymous(
-            vm_fd.raw(),
-            &mut slot_id,
-            BIOS_START,
-            BIOS_SIZE,
-            0,
-        )?);
+        let bios_slot = MemorySlot::anonymous(vm_fd.raw(), &mut slot_id, BIOS_START, BIOS_SIZE, 0)?;
         slots.push(MemorySlot::anonymous(
             vm_fd.raw(),
             &mut slot_id,
@@ -107,13 +138,8 @@ impl KvmGba {
             EWRAM_SIZE,
             0,
         )?);
-        slots.push(MemorySlot::anonymous(
-            vm_fd.raw(),
-            &mut slot_id,
-            IWRAM_START,
-            IWRAM_SIZE,
-            0,
-        )?);
+        let iwram_slot =
+            MemorySlot::anonymous(vm_fd.raw(), &mut slot_id, IWRAM_START, IWRAM_SIZE, 0)?;
         let io_slot = MemorySlot::anonymous(
             vm_fd.raw(),
             &mut slot_id,
@@ -143,10 +169,14 @@ impl KvmGba {
             cartridge.rom(),
         )?);
 
+        install_cache_bootstrap(&bios_slot.region, &iwram_slot.region);
+
         let shared = Arc::new(KvmSharedMemory {
             io: io_slot.region.clone_for_shared(),
             vram: vram_slot.region.clone_for_shared(),
         });
+        slots.push(bios_slot);
+        slots.push(iwram_slot);
         slots.push(io_slot);
         slots.push(vram_slot);
 
@@ -188,11 +218,7 @@ impl KvmGba {
             return Err(last_os_error("KVM_ARM_VCPU_INIT"));
         }
 
-        set_one_reg_u64(
-            vcpu_fd.raw(),
-            sys::reg_arm64_core_pc(),
-            GAME_PAK_ROM_START as u64,
-        )?;
+        set_one_reg_u64(vcpu_fd.raw(), sys::reg_arm64_core_pc(), BIOS_START as u64)?;
 
         Ok(Self {
             kvm_fd,
@@ -247,6 +273,24 @@ impl KvmGba {
     }
 }
 
+fn install_cache_bootstrap(bios: &MemoryRegion, iwram: &MemoryRegion) {
+    for (index, word) in CACHE_BOOTSTRAP.iter().enumerate() {
+        let offset = index * 4;
+        bios.as_mut_slice()[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    clean_dcache_area(bios.ptr, CACHE_BOOTSTRAP.len() * 4);
+
+    let table =
+        &mut iwram.as_mut_slice()[PAGE_TABLE_IWRAM_OFFSET..PAGE_TABLE_IWRAM_OFFSET + 0x4000];
+    for section in 0..4096u32 {
+        let base = section * SECTION_SIZE;
+        let entry = base | NORMAL_SHARED_WBWA_SECTION;
+        let offset = section as usize * 4;
+        table[offset..offset + 4].copy_from_slice(&entry.to_le_bytes());
+    }
+    clean_dcache_area(iwram.ptr_at(PAGE_TABLE_IWRAM_OFFSET), 0x4000);
+}
+
 fn set_one_reg_u64(vcpu_fd: RawFd, id: u64, mut value: u64) -> Result<(), String> {
     let mut reg = sys::KvmOneReg {
         id,
@@ -287,6 +331,7 @@ impl MemorySlot {
         let size = align_up(rom.len(), page_size()?);
         let region = MemoryRegion::anonymous(size)?;
         region.as_mut_slice()[..rom.len()].copy_from_slice(rom);
+        clean_dcache_area(region.ptr, rom.len());
         set_user_memory_region(
             vm_fd,
             *next_slot,
@@ -364,6 +409,10 @@ impl MemoryRegion {
 
     fn as_mut_slice(&self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    fn ptr_at(&self, offset: usize) -> *mut u8 {
+        unsafe { self.ptr.add(offset) }
     }
 
     fn clone_for_shared(&self) -> Self {
@@ -473,3 +522,29 @@ fn align_up(value: usize, align: usize) -> usize {
 fn last_os_error(context: &str) -> String {
     format!("{context}: {}", std::io::Error::last_os_error())
 }
+
+#[cfg(target_arch = "aarch64")]
+fn clean_dcache_area(ptr: *mut u8, len: usize) {
+    use std::arch::asm;
+
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+
+    /* */
+    let start = ptr as usize & !63;
+    let end = (ptr as usize + len + 63) & !63;
+    let mut addr = start;
+    while addr < end {
+        unsafe {
+            asm!("dc cvac, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
+        }
+        addr += 64;
+    }
+    unsafe {
+        asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn clean_dcache_area(_ptr: *mut u8, _len: usize) {}
