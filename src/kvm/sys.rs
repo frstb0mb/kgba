@@ -48,6 +48,7 @@ pub const KVM_GET_VCPU_MMAP_SIZE: c_ulong = io(KVMIO, 0x04);
 pub const KVM_CREATE_VCPU: c_ulong = io(KVMIO, 0x41);
 pub const KVM_SET_USER_MEMORY_REGION: c_ulong = iow::<KvmUserspaceMemoryRegion>(KVMIO, 0x46);
 pub const KVM_RUN: c_ulong = io(KVMIO, 0x80);
+pub const KVM_IRQ_LINE: c_ulong = iow::<KvmIrqLevel>(KVMIO, 0x61);
 pub const KVM_SET_ONE_REG: c_ulong = iow::<KvmOneReg>(KVMIO, 0xac);
 pub const KVM_ARM_VCPU_INIT: c_ulong = iow::<KvmVcpuInit>(KVMIO, 0xae);
 pub const KVM_ARM_PREFERRED_TARGET: c_ulong = ior::<KvmVcpuInit>(KVMIO, 0xaf);
@@ -85,6 +86,12 @@ pub struct KvmVcpuInit {
 pub struct KvmOneReg {
     pub id: u64,
     pub addr: u64,
+}
+
+#[repr(C)]
+pub struct KvmIrqLevel {
+    pub irq: u32,
+    pub level: u32,
 }
 
 #[repr(C)]

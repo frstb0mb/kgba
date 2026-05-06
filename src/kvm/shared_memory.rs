@@ -1,16 +1,25 @@
-use std::sync::Mutex;
+use std::{
+    os::fd::RawFd,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use crate::gba::{
     memory_map::{
         BG0CNT, BG0HOFS, BG0VOFS, BG1CNT, BG1HOFS, BG1VOFS, BG2CNT, BG2HOFS, BG2VOFS, BG3CNT,
-        BG3HOFS, BG3VOFS, DISPCNT, DMA0CNT, DMA0SAD, EWRAM_SIZE, EWRAM_START, GAME_PAK_ROM_START,
-        IO_START, IWRAM_SIZE, IWRAM_START, KEYINPUT, OAM_SIZE, OAM_START, PALETTE_SIZE,
-        PALETTE_START, VCOUNT, VRAM_SIZE, VRAM_START,
+        BG3HOFS, BG3VOFS, DISPCNT, DISPSTAT, DMA0CNT, DMA0SAD, EWRAM_SIZE, EWRAM_START,
+        GAME_PAK_ROM_START, IE, IF, IME, IO_START, IWRAM_SIZE, IWRAM_START, KEYINPUT, OAM_SIZE,
+        OAM_START, PALETTE_SIZE, PALETTE_START, VCOUNT, VRAM_SIZE, VRAM_START,
     },
     ppu::{FrameBuffer, Ppu},
 };
 
-use super::{memory::MemoryRegion, timers::Timers, trace::trace_timer_register_write};
+use super::{
+    memory::MemoryRegion, sys, timers::Timers, trace::trace_timer_register_write,
+    util::last_os_error,
+};
 
 #[derive(Debug)]
 pub struct KvmSharedMemory {
@@ -22,6 +31,7 @@ pub struct KvmSharedMemory {
     pub(super) oam: MemoryRegion,
     rom: Box<[u8]>,
     pub(super) timers: Mutex<Timers>,
+    interrupt_line: InterruptLine,
 }
 
 unsafe impl Send for KvmSharedMemory {}
@@ -36,6 +46,7 @@ impl KvmSharedMemory {
         vram: MemoryRegion,
         oam: MemoryRegion,
         rom: &[u8],
+        vm_fd: RawFd,
     ) -> Self {
         Self {
             ewram,
@@ -46,11 +57,25 @@ impl KvmSharedMemory {
             oam,
             rom: rom.to_vec().into_boxed_slice(),
             timers: Mutex::new(Timers::new()),
+            interrupt_line: InterruptLine::new(vm_fd),
         }
     }
 
     pub fn set_vcount(&self, value: u16) {
+        let old_dispstat = self.read_io_u16(DISPSTAT);
         self.write_io_u16(VCOUNT, value);
+        let mut dispstat = old_dispstat & !DISPSTAT_VBLANK;
+        if value >= 160 {
+            dispstat |= DISPSTAT_VBLANK;
+        }
+        self.write_io_u16(DISPSTAT, dispstat);
+
+        if old_dispstat & DISPSTAT_VBLANK == 0
+            && dispstat & DISPSTAT_VBLANK != 0
+            && dispstat & DISPSTAT_VBLANK_IRQ_ENABLE != 0
+        {
+            self.request_interrupt(IRQ_VBLANK);
+        }
     }
 
     pub fn tick_scanline(&self) {
@@ -98,9 +123,23 @@ impl KvmSharedMemory {
     }
 
     pub(super) fn mirror_io_write(&self, addr: u32, len: u32, data: &[u8; 8]) {
+        let old_if = self.read_io_u16(IF);
+        let old_dispstat = self.read_io_u16(DISPSTAT);
+        let if_write = io_register_write(IF, addr, len, data);
+        let dispstat_write = io_register_write(DISPSTAT, addr, len, data);
         let offset = (addr - IO_START) as usize;
         let len = len as usize;
         self.io.as_mut_slice()[offset..offset + len].copy_from_slice(&data[..len]);
+        if let Some(write) = if_write {
+            self.write_io_u16(IF, old_if & !write.value);
+        }
+        if let Some(write) = dispstat_write {
+            let writable = write.value & DISPSTAT_WRITABLE_MASK;
+            let preserved = old_dispstat & !write.mask;
+            let status = old_dispstat & DISPSTAT_STATUS_MASK;
+            self.write_io_u16(DISPSTAT, status | preserved | writable);
+        }
+        self.update_interrupt_line();
     }
 
     pub(super) fn run_immediate_dma_for_io_write(&self, addr: u32, len: u32) {
@@ -140,6 +179,19 @@ impl KvmSharedMemory {
             .lock()
             .expect("timer lock poisoned")
             .advance(cycles, &self.io);
+    }
+
+    fn request_interrupt(&self, interrupt: u16) {
+        self.write_io_u16(IF, self.read_io_u16(IF) | interrupt);
+        self.update_interrupt_line();
+    }
+
+    fn update_interrupt_line(&self) {
+        let enabled = self.read_io_u16(IE);
+        let requested = self.read_io_u16(IF);
+        let master_enabled = self.read_io_u16(IME) & 1 != 0;
+        self.interrupt_line
+            .set(master_enabled && enabled & requested != 0);
     }
 
     fn run_immediate_dma_if_enabled(&self, addr: u32) {
@@ -222,10 +274,109 @@ impl KvmSharedMemory {
     }
 }
 
+const DISPSTAT_VBLANK: u16 = 1 << 0;
+const DISPSTAT_STATUS_MASK: u16 = 0x0007;
+const DISPSTAT_WRITABLE_MASK: u16 = 0xff38;
+const DISPSTAT_VBLANK_IRQ_ENABLE: u16 = 1 << 3;
+const IRQ_VBLANK: u16 = 1 << 0;
 const DMA_ENABLE: u16 = 1 << 15;
 const DMA_REPEAT: u16 = 1 << 9;
 const DMA_32BIT: u16 = 1 << 10;
 const DMA_TIMING_MASK: u16 = 0x3000;
+
+#[derive(Debug)]
+struct InterruptLine {
+    vm_fd: RawFd,
+    asserted: AtomicBool,
+}
+
+impl InterruptLine {
+    fn new(vm_fd: RawFd) -> Self {
+        Self {
+            vm_fd,
+            asserted: AtomicBool::new(false),
+        }
+    }
+
+    fn set(&self, asserted: bool) {
+        if self.asserted.swap(asserted, Ordering::Relaxed) == asserted {
+            return;
+        }
+
+        let mut level = sys::KvmIrqLevel {
+            irq: KVM_ARM_CPU_IRQ,
+            level: u32::from(asserted),
+        };
+        let ret = unsafe {
+            sys::ioctl_ptr(
+                self.vm_fd,
+                sys::KVM_IRQ_LINE,
+                (&mut level as *mut sys::KvmIrqLevel).cast(),
+            )
+        };
+        if ret != 0 {
+            eprintln!("{}", last_os_error("KVM_IRQ_LINE"));
+        }
+    }
+}
+
+const KVM_ARM_CPU_IRQ: u32 = 0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IoRegisterWrite {
+    mask: u16,
+    value: u16,
+}
+
+fn io_register_write(
+    register: u32,
+    addr: u32,
+    len: u32,
+    data: &[u8; 8],
+) -> Option<IoRegisterWrite> {
+    let mut mask = 0;
+    let mut value = 0;
+    for index in 0..len as usize {
+        let byte_addr = addr + index as u32;
+        if !(register..register + 2).contains(&byte_addr) {
+            continue;
+        }
+        let shift = (byte_addr - register) * 8;
+        mask |= 0xff << shift;
+        value |= u16::from(data[index]) << shift;
+    }
+    if mask == 0 {
+        None
+    } else {
+        Some(IoRegisterWrite { mask, value })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IoRegisterWrite, io_register_write};
+
+    #[test]
+    fn io_register_write_extracts_partial_halfword_write() {
+        let data = [0x34, 0x12, 0, 0, 0, 0, 0, 0];
+
+        assert_eq!(
+            io_register_write(0x0400_0202, 0x0400_0202, 2, &data),
+            Some(IoRegisterWrite {
+                mask: 0xffff,
+                value: 0x1234
+            })
+        );
+        assert_eq!(
+            io_register_write(0x0400_0202, 0x0400_0203, 1, &data),
+            Some(IoRegisterWrite {
+                mask: 0xff00,
+                value: 0x3400
+            })
+        );
+        assert_eq!(io_register_write(0x0400_0202, 0x0400_0204, 2, &data), None);
+    }
+}
 
 fn dma_channel_for_cnt_high(addr: u32) -> Option<usize> {
     if addr < DMA0CNT + 2 || addr > DMA0CNT + 2 + 3 * 12 {

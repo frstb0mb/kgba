@@ -102,6 +102,7 @@ impl KvmGba {
             vram_slot.region.clone_for_shared(),
             oam_slot.region.clone_for_shared(),
             cartridge.rom(),
+            vm_fd.raw(),
         ));
         shared.write_io_u16(KEYINPUT, 0x03ff);
         slots.push(bios_slot);

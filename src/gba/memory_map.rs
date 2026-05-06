@@ -49,3 +49,6 @@ pub const DMA3SAD: u32 = IO_START + 0x00d4;
 pub const DMA3DAD: u32 = IO_START + 0x00d8;
 pub const DMA3CNT: u32 = IO_START + 0x00dc;
 pub const KEYINPUT: u32 = IO_START + 0x0130;
+pub const IE: u32 = IO_START + 0x0200;
+pub const IF: u32 = IO_START + 0x0202;
+pub const IME: u32 = IO_START + 0x0208;

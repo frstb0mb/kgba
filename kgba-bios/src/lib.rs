@@ -4,6 +4,7 @@ pub const BIOS_SIZE: usize = 0x4000;
 
 const BIOS_RESET_HANDLER_OFFSET: usize = 0x40;
 const BIOS_SWI_HANDLER_OFFSET: usize = 0x100;
+const BIOS_IRQ_HANDLER_OFFSET: usize = 0x140;
 
 const BIOS_VECTOR_TABLE: [u32; 8] = [
     0xea00_000e, // reset -> 0x40
@@ -12,7 +13,7 @@ const BIOS_VECTOR_TABLE: [u32; 8] = [
     0xeaff_fffe, // prefetch abort
     0xeaff_fffe, // data abort
     0xeaff_fffe, // reserved
-    0xeaff_fffe, // irq
+    0xea00_0048, // irq -> 0x140
     0xeaff_fffe, // fiq
 ];
 
@@ -37,6 +38,16 @@ const BIOS_SWI_HANDLER: [u32; 14] = [
     0xe1b0_f00e, // movs pc, lr
 ];
 
+const BIOS_IRQ_HANDLER: [u32; 7] = [
+    0xe92d_500f, // stmdb sp!, {r0-r3, r12, lr}
+    0xe59f_000c, // ldr r0, [pc, #0x0c] ; 0x03007ffc
+    0xe28f_e000, // add lr, pc, #0
+    0xe590_f000, // ldr pc, [r0]
+    0xe8bd_500f, // ldmia sp!, {r0-r3, r12, lr}
+    0xe25e_f004, // subs pc, lr, #4
+    0x0300_7ffc,
+];
+
 pub const DEFAULT_BIOS_IMAGE: [u8; BIOS_SIZE] = build_default_bios_image();
 
 pub const fn default_bios_image() -> [u8; BIOS_SIZE] {
@@ -48,6 +59,7 @@ const fn build_default_bios_image() -> [u8; BIOS_SIZE] {
     image = write_words(image, 0, &BIOS_VECTOR_TABLE);
     image = write_words(image, BIOS_RESET_HANDLER_OFFSET, &BIOS_RESET_HANDLER);
     image = write_words(image, BIOS_SWI_HANDLER_OFFSET, &BIOS_SWI_HANDLER);
+    image = write_words(image, BIOS_IRQ_HANDLER_OFFSET, &BIOS_IRQ_HANDLER);
     image
 }
 
