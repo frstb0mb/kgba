@@ -10,8 +10,8 @@ use crate::gba::{
     memory_map::{
         BG0CNT, BG0HOFS, BG0VOFS, BG1CNT, BG1HOFS, BG1VOFS, BG2CNT, BG2HOFS, BG2VOFS, BG3CNT,
         BG3HOFS, BG3VOFS, DISPCNT, DISPSTAT, DMA0CNT, DMA0SAD, EWRAM_SIZE, EWRAM_START,
-        GAME_PAK_ROM_START, IE, IF, IME, IO_START, IWRAM_SIZE, IWRAM_START, KEYINPUT, OAM_SIZE,
-        OAM_START, PALETTE_SIZE, PALETTE_START, VCOUNT, VRAM_SIZE, VRAM_START,
+        GAME_PAK_ROM_START, IE, IF, IME, IO_START, IWRAM_SIZE, IWRAM_START, KEYINPUT, MOSAIC,
+        OAM_SIZE, OAM_START, PALETTE_SIZE, PALETTE_START, VCOUNT, VRAM_SIZE, VRAM_START,
     },
     ppu::{FrameBuffer, Ppu},
 };
@@ -101,6 +101,7 @@ impl KvmSharedMemory {
         ppu.write_bgvofs(1, self.read_io_u16(BG1VOFS));
         ppu.write_bgvofs(2, self.read_io_u16(BG2VOFS));
         ppu.write_bgvofs(3, self.read_io_u16(BG3VOFS));
+        ppu.write_mosaic(self.read_io_u16(MOSAIC));
         ppu.render_frame(
             self.palette.as_slice(),
             self.vram.as_slice(),

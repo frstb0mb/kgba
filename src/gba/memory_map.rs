@@ -36,6 +36,7 @@ pub const BG2HOFS: u32 = IO_START + 0x0018;
 pub const BG2VOFS: u32 = IO_START + 0x001a;
 pub const BG3HOFS: u32 = IO_START + 0x001c;
 pub const BG3VOFS: u32 = IO_START + 0x001e;
+pub const MOSAIC: u32 = IO_START + 0x004c;
 pub const DMA0SAD: u32 = IO_START + 0x00b0;
 pub const DMA0DAD: u32 = IO_START + 0x00b4;
 pub const DMA0CNT: u32 = IO_START + 0x00b8;

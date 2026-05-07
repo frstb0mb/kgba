@@ -2,7 +2,7 @@ use super::{
     memory::GbaMemory,
     memory_map::{
         BG0CNT, BG0HOFS, BG0VOFS, BG1CNT, BG1HOFS, BG1VOFS, BG2CNT, BG2HOFS, BG2VOFS, BG3CNT,
-        BG3HOFS, BG3VOFS, DISPCNT, DISPSTAT, IO_SIZE, IO_START, KEYINPUT, VCOUNT,
+        BG3HOFS, BG3VOFS, DISPCNT, DISPSTAT, IO_SIZE, IO_START, KEYINPUT, MOSAIC, VCOUNT,
     },
     ppu::{FrameBuffer, Ppu},
 };
@@ -101,6 +101,7 @@ impl<'a> Bus<'a> {
             BG1VOFS => self.ppu.bgvofs(1),
             BG2VOFS => self.ppu.bgvofs(2),
             BG3VOFS => self.ppu.bgvofs(3),
+            MOSAIC => self.ppu.mosaic(),
             KEYINPUT => 0x03ff,
             IO_START..=0x0400_03ff => self.read_io_halfword(addr),
             _ => 0,
@@ -137,6 +138,7 @@ impl<'a> Bus<'a> {
             BG1VOFS => self.ppu.write_bgvofs(1, value),
             BG2VOFS => self.ppu.write_bgvofs(2, value),
             BG3VOFS => self.ppu.write_bgvofs(3, value),
+            MOSAIC => self.ppu.write_mosaic(value),
             IO_START..=0x0400_03ff => {}
             _ => {}
         }

@@ -17,6 +17,7 @@ pub const BG3_ENABLE: u16 = 1 << 11;
 pub const OBJ_ENABLE: u16 = 1 << 12;
 
 const BG_ENABLE: [u16; 4] = [BG0_ENABLE, BG1_ENABLE, BG2_ENABLE, BG3_ENABLE];
+const BG_MOSAIC: u16 = 1 << 6;
 const BG_TILE_SIZE: usize = 8;
 const SCREEN_BLOCK_SIZE: usize = 0x800;
 const CHAR_BLOCK_SIZE: usize = 0x4000;
@@ -42,6 +43,7 @@ pub struct Ppu {
     bgcnt: [u16; 4],
     bghofs: [u16; 4],
     bgvofs: [u16; 4],
+    mosaic: u16,
 }
 
 impl Ppu {
@@ -93,6 +95,10 @@ impl Ppu {
         self.bgvofs[bg]
     }
 
+    pub fn mosaic(&self) -> u16 {
+        self.mosaic
+    }
+
     pub fn write_bgcnt(&mut self, bg: usize, value: u16) {
         self.bgcnt[bg] = value;
     }
@@ -103,6 +109,10 @@ impl Ppu {
 
     pub fn write_bgvofs(&mut self, bg: usize, value: u16) {
         self.bgvofs[bg] = value & 0x01ff;
+    }
+
+    pub fn write_mosaic(&mut self, value: u16) {
+        self.mosaic = value;
     }
 
     pub fn step_scanline(&mut self) {
@@ -165,7 +175,8 @@ impl Ppu {
 
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
-                let offset = (y * WIDTH + x) * 2;
+                let (source_x, source_y) = self.bg2_bitmap_source_pixel(x, y);
+                let offset = (source_y * WIDTH + source_x) * 2;
                 let color = u16::from_le_bytes([vram[offset], vram[offset + 1]]);
                 frame[y * WIDTH + x] = bgr555_to_argb8888(color);
             }
@@ -189,7 +200,8 @@ impl Ppu {
 
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
-                let color_index = usize::from(vram[page_offset + y * WIDTH + x]);
+                let (source_x, source_y) = self.bg2_bitmap_source_pixel(x, y);
+                let color_index = usize::from(vram[page_offset + source_y * WIDTH + source_x]);
                 let palette_offset = color_index * 2;
                 let color =
                     u16::from_le_bytes([palette[palette_offset], palette[palette_offset + 1]]);
@@ -215,7 +227,10 @@ impl Ppu {
 
         for y in 0..MODE5_HEIGHT {
             for x in 0..MODE5_WIDTH {
-                let offset = page_offset + (y * MODE5_WIDTH + x) * 2;
+                let (source_x, source_y) = self.bg2_bitmap_source_pixel(x, y);
+                let source_x = source_x.min(MODE5_WIDTH - 1);
+                let source_y = source_y.min(MODE5_HEIGHT - 1);
+                let offset = page_offset + (source_y * MODE5_WIDTH + source_x) * 2;
                 let color = u16::from_le_bytes([vram[offset], vram[offset + 1]]);
                 frame[y * WIDTH + x] = bgr555_to_argb8888(color);
             }
@@ -308,6 +323,18 @@ impl Ppu {
             MODE_0..=0x0002 => OBJ_TILE_BASE_TEXT_MODE,
             _ => OBJ_TILE_BASE_BITMAP_MODE,
         }
+    }
+
+    fn bg2_bitmap_source_pixel(&self, x: usize, y: usize) -> (usize, usize) {
+        if self.bgcnt[2] & BG_MOSAIC == 0 {
+            return (x, y);
+        }
+
+        let (mosaic_width, mosaic_height) = bg_mosaic_size(self.mosaic);
+        (
+            x / mosaic_width * mosaic_width,
+            y / mosaic_height * mosaic_height,
+        )
     }
 
     fn render_text_bg(&self, bg: usize, palette: &[u8], vram: &[u8], frame: &mut [u32]) {
@@ -432,6 +459,13 @@ fn text_bg_size(bgcnt: u16) -> (usize, usize) {
     }
 }
 
+fn bg_mosaic_size(mosaic: u16) -> (usize, usize) {
+    (
+        usize::from(mosaic & 0x000f) + 1,
+        usize::from((mosaic >> 4) & 0x000f) + 1,
+    )
+}
+
 fn read_u16_checked(memory: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes([
         *memory.get(offset)?,
@@ -506,6 +540,26 @@ mod tests {
 
         assert_eq!(frame[0], 0xffff0000);
         assert_eq!(frame[1], 0xff000000);
+    }
+
+    #[test]
+    fn mode3_applies_bg2_mosaic() {
+        let mut vram = vec![0; WIDTH * HEIGHT * 2];
+        vram[0..2].copy_from_slice(&rgb5(31, 0, 0).to_le_bytes());
+        vram[2..4].copy_from_slice(&rgb5(0, 31, 0).to_le_bytes());
+        vram[WIDTH * 2..WIDTH * 2 + 2].copy_from_slice(&rgb5(0, 0, 31).to_le_bytes());
+
+        let mut ppu = Ppu::new();
+        ppu.write_dispcnt(MODE_3 | BG2_ENABLE);
+        ppu.write_bgcnt(2, BG_MOSAIC);
+        ppu.write_mosaic(0x0011);
+
+        let frame = ppu.render_mode3(&vram);
+
+        assert_eq!(frame[0], 0xffff0000);
+        assert_eq!(frame[1], 0xffff0000);
+        assert_eq!(frame[WIDTH], 0xffff0000);
+        assert_eq!(frame[WIDTH + 2], 0xff000000);
     }
 
     #[test]
