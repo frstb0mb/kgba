@@ -2,7 +2,8 @@ use super::{
     memory::GbaMemory,
     memory_map::{
         BG0CNT, BG0HOFS, BG0VOFS, BG1CNT, BG1HOFS, BG1VOFS, BG2CNT, BG2HOFS, BG2VOFS, BG3CNT,
-        BG3HOFS, BG3VOFS, DISPCNT, DISPSTAT, IO_SIZE, IO_START, KEYINPUT, MOSAIC, VCOUNT,
+        BG3HOFS, BG3VOFS, DISPCNT, DISPSTAT, IO_SIZE, IO_START, KEYINPUT, MOSAIC, VCOUNT, WIN0H,
+        WIN0V, WIN1H, WIN1V, WININ, WINOUT,
     },
     ppu::{FrameBuffer, Ppu},
 };
@@ -101,6 +102,12 @@ impl<'a> Bus<'a> {
             BG1VOFS => self.ppu.bgvofs(1),
             BG2VOFS => self.ppu.bgvofs(2),
             BG3VOFS => self.ppu.bgvofs(3),
+            WIN0H => self.ppu.winh(0),
+            WIN1H => self.ppu.winh(1),
+            WIN0V => self.ppu.winv(0),
+            WIN1V => self.ppu.winv(1),
+            WININ => self.ppu.winin(),
+            WINOUT => self.ppu.winout(),
             MOSAIC => self.ppu.mosaic(),
             KEYINPUT => 0x03ff,
             IO_START..=0x0400_03ff => self.read_io_halfword(addr),
@@ -138,6 +145,12 @@ impl<'a> Bus<'a> {
             BG1VOFS => self.ppu.write_bgvofs(1, value),
             BG2VOFS => self.ppu.write_bgvofs(2, value),
             BG3VOFS => self.ppu.write_bgvofs(3, value),
+            WIN0H => self.ppu.write_winh(0, value),
+            WIN1H => self.ppu.write_winh(1, value),
+            WIN0V => self.ppu.write_winv(0, value),
+            WIN1V => self.ppu.write_winv(1, value),
+            WININ => self.ppu.write_winin(value),
+            WINOUT => self.ppu.write_winout(value),
             MOSAIC => self.ppu.write_mosaic(value),
             IO_START..=0x0400_03ff => {}
             _ => {}
@@ -184,5 +197,19 @@ mod tests {
         bus.ppu_mut().step_scanline();
 
         assert_eq!(bus.read(DISPSTAT, AccessSize::Word) >> 16, 1);
+    }
+
+    #[test]
+    fn window_registers_accept_halfword_and_byte_access() {
+        let mut memory = GbaMemory::new();
+        let mut bus = Bus::new(&mut memory);
+
+        bus.write(WIN0H, AccessSize::Halfword, 0x1428);
+        bus.write(WININ, AccessSize::Byte, 0x02);
+        bus.write(WINOUT + 1, AccessSize::Byte, 0x20);
+
+        assert_eq!(bus.read(WIN0H, AccessSize::Halfword), 0x1428);
+        assert_eq!(bus.read(WININ, AccessSize::Halfword), 0x02);
+        assert_eq!(bus.read(WINOUT, AccessSize::Halfword), 0x2000);
     }
 }

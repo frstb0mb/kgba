@@ -15,8 +15,19 @@ pub const BG1_ENABLE: u16 = 1 << 9;
 pub const BG2_ENABLE: u16 = 1 << 10;
 pub const BG3_ENABLE: u16 = 1 << 11;
 pub const OBJ_ENABLE: u16 = 1 << 12;
+pub const WIN0_ENABLE: u16 = 1 << 13;
+pub const WIN1_ENABLE: u16 = 1 << 14;
+pub const OBJ_WIN_ENABLE: u16 = 1 << 15;
 
 const BG_ENABLE: [u16; 4] = [BG0_ENABLE, BG1_ENABLE, BG2_ENABLE, BG3_ENABLE];
+const WIN_LAYER_BG0: u16 = 1 << 0;
+const WIN_LAYER_BG1: u16 = 1 << 1;
+const WIN_LAYER_BG2: u16 = 1 << 2;
+const WIN_LAYER_BG3: u16 = 1 << 3;
+const WIN_LAYER_OBJ: u16 = 1 << 4;
+const WIN_LAYER_ALL: u16 =
+    WIN_LAYER_BG0 | WIN_LAYER_BG1 | WIN_LAYER_BG2 | WIN_LAYER_BG3 | WIN_LAYER_OBJ;
+const WIN_LAYER_BG: [u16; 4] = [WIN_LAYER_BG0, WIN_LAYER_BG1, WIN_LAYER_BG2, WIN_LAYER_BG3];
 const BG_MOSAIC: u16 = 1 << 6;
 const BG_TILE_SIZE: usize = 8;
 const SCREEN_BLOCK_SIZE: usize = 0x800;
@@ -43,6 +54,10 @@ pub struct Ppu {
     bgcnt: [u16; 4],
     bghofs: [u16; 4],
     bgvofs: [u16; 4],
+    winh: [u16; 2],
+    winv: [u16; 2],
+    winin: u16,
+    winout: u16,
     mosaic: u16,
 }
 
@@ -99,6 +114,22 @@ impl Ppu {
         self.mosaic
     }
 
+    pub fn winh(&self, window: usize) -> u16 {
+        self.winh[window]
+    }
+
+    pub fn winv(&self, window: usize) -> u16 {
+        self.winv[window]
+    }
+
+    pub fn winin(&self) -> u16 {
+        self.winin
+    }
+
+    pub fn winout(&self) -> u16 {
+        self.winout
+    }
+
     pub fn write_bgcnt(&mut self, bg: usize, value: u16) {
         self.bgcnt[bg] = value;
     }
@@ -109,6 +140,22 @@ impl Ppu {
 
     pub fn write_bgvofs(&mut self, bg: usize, value: u16) {
         self.bgvofs[bg] = value & 0x01ff;
+    }
+
+    pub fn write_winh(&mut self, window: usize, value: u16) {
+        self.winh[window] = value;
+    }
+
+    pub fn write_winv(&mut self, window: usize, value: u16) {
+        self.winv[window] = value;
+    }
+
+    pub fn write_winin(&mut self, value: u16) {
+        self.winin = value & 0x3f3f;
+    }
+
+    pub fn write_winout(&mut self, value: u16) {
+        self.winout = value & 0x3f3f;
     }
 
     pub fn write_mosaic(&mut self, value: u16) {
@@ -156,11 +203,30 @@ impl Ppu {
 
         let mut bgs = [0usize, 1, 2, 3];
         bgs.sort_by_key(|&bg| (self.bg_priority(bg), bg));
-        for bg in bgs.into_iter().rev() {
-            if self.dispcnt & BG_ENABLE[bg] == 0 {
-                continue;
+
+        if !self.windows_enabled() {
+            for bg in bgs.into_iter().rev() {
+                if self.dispcnt & BG_ENABLE[bg] == 0 {
+                    continue;
+                }
+                self.render_text_bg(bg, palette, vram, &mut frame);
             }
-            self.render_text_bg(bg, palette, vram, &mut frame);
+            return frame;
+        }
+
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let mask = self.window_mask(x, y);
+                for bg in bgs {
+                    if self.dispcnt & BG_ENABLE[bg] == 0 || mask & WIN_LAYER_BG[bg] == 0 {
+                        continue;
+                    }
+                    if let Some(color) = self.text_bg_pixel(bg, x, y, palette, vram) {
+                        frame[y * WIDTH + x] = color;
+                        break;
+                    }
+                }
+            }
         }
 
         frame
@@ -338,41 +404,63 @@ impl Ppu {
     }
 
     fn render_text_bg(&self, bg: usize, palette: &[u8], vram: &[u8], frame: &mut [u32]) {
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                if let Some(color) = self.text_bg_pixel(bg, x, y, palette, vram) {
+                    frame[y * WIDTH + x] = color;
+                }
+            }
+        }
+    }
+
+    fn text_bg_pixel(
+        &self,
+        bg: usize,
+        screen_x: usize,
+        screen_y: usize,
+        palette: &[u8],
+        vram: &[u8],
+    ) -> Option<u32> {
         let bgcnt = self.bgcnt[bg];
         let char_base = usize::from((bgcnt >> 2) & 0x3) * CHAR_BLOCK_SIZE;
         let screen_base = usize::from((bgcnt >> 8) & 0x1f) * SCREEN_BLOCK_SIZE;
         let is_8bpp = bgcnt & (1 << 7) != 0;
         let (bg_width, bg_height) = text_bg_size(bgcnt);
 
-        for y in 0..HEIGHT {
-            let bg_y = (y + usize::from(self.bgvofs[bg])) % bg_height;
-            for x in 0..WIDTH {
-                let bg_x = (x + usize::from(self.bghofs[bg])) % bg_width;
-                let Some(color_index) = text_bg_color_index(
-                    vram,
-                    char_base,
-                    screen_base,
-                    is_8bpp,
-                    bg_width,
-                    bg_x,
-                    bg_y,
-                ) else {
-                    continue;
-                };
-                if color_index == 0 {
-                    continue;
-                }
-
-                let palette_offset = usize::from(color_index) * 2;
-                if let Some(color) = read_u16_checked(palette, palette_offset) {
-                    frame[y * WIDTH + x] = bgr555_to_argb8888(color);
-                }
-            }
+        let bg_x = (screen_x + usize::from(self.bghofs[bg])) % bg_width;
+        let bg_y = (screen_y + usize::from(self.bgvofs[bg])) % bg_height;
+        let color_index =
+            text_bg_color_index(vram, char_base, screen_base, is_8bpp, bg_width, bg_x, bg_y)?;
+        if color_index == 0 {
+            return None;
         }
+        read_u16_checked(palette, usize::from(color_index) * 2).map(bgr555_to_argb8888)
     }
 
     fn bg_priority(&self, bg: usize) -> u16 {
         self.bgcnt[bg] & 0x3
+    }
+
+    fn windows_enabled(&self) -> bool {
+        self.dispcnt & (WIN0_ENABLE | WIN1_ENABLE | OBJ_WIN_ENABLE) != 0
+    }
+
+    fn window_mask(&self, x: usize, y: usize) -> u16 {
+        if self.dispcnt & WIN0_ENABLE != 0 && self.window_contains(0, x, y) {
+            self.winin & 0x003f
+        } else if self.dispcnt & WIN1_ENABLE != 0 && self.window_contains(1, x, y) {
+            (self.winin >> 8) & 0x003f
+        } else {
+            self.winout & WIN_LAYER_ALL
+        }
+    }
+
+    fn window_contains(&self, window: usize, x: usize, y: usize) -> bool {
+        let left = usize::from((self.winh[window] >> 8) & 0xff).min(WIDTH);
+        let right = usize::from(self.winh[window] & 0xff).min(WIDTH);
+        let top = usize::from((self.winv[window] >> 8) & 0xff).min(HEIGHT);
+        let bottom = usize::from(self.winv[window] & 0xff).min(HEIGHT);
+        x >= left && x < right && y >= top && y < bottom
     }
 }
 
@@ -637,6 +725,37 @@ mod tests {
 
         assert_eq!(frame[0], 0xff00ff00);
         assert_eq!(frame[1], 0xffff0000);
+    }
+
+    #[test]
+    fn mode0_win0_selects_different_backgrounds_inside_and_outside() {
+        let mut palette = vec![0; 0x400];
+        palette[2..4].copy_from_slice(&rgb5(31, 0, 0).to_le_bytes());
+        palette[16 * 2 + 2..16 * 2 + 4].copy_from_slice(&rgb5(0, 31, 0).to_le_bytes());
+
+        let mut vram = vec![0; 0x18000];
+        vram[0..32].fill(0x11);
+        vram[2 * CHAR_BLOCK_SIZE..2 * CHAR_BLOCK_SIZE + 32].fill(0x11);
+        for tile in 0..32 * 32 {
+            write_vram_halfword_offset(&mut vram, 11 * SCREEN_BLOCK_SIZE + tile * 2, 0);
+            write_vram_halfword_offset(&mut vram, 12 * SCREEN_BLOCK_SIZE + tile * 2, 1 << 12);
+        }
+
+        let mut ppu = Ppu::new();
+        ppu.write_dispcnt(MODE_0 | BG0_ENABLE | BG1_ENABLE | WIN0_ENABLE);
+        ppu.write_bgcnt(0, 11 << 8);
+        ppu.write_bgcnt(1, (2 << 2) | (12 << 8));
+        ppu.write_winh(0, (20 << 8) | 84);
+        ppu.write_winv(0, (20 << 8) | 84);
+        ppu.write_winin(WIN_LAYER_BG1);
+        ppu.write_winout(WIN_LAYER_BG0);
+
+        let frame = ppu.render_mode0(&palette, &vram);
+
+        assert_eq!(frame[19 * WIDTH + 20], 0xffff0000);
+        assert_eq!(frame[20 * WIDTH + 20], 0xff00ff00);
+        assert_eq!(frame[83 * WIDTH + 83], 0xff00ff00);
+        assert_eq!(frame[84 * WIDTH + 83], 0xffff0000);
     }
 
     #[test]

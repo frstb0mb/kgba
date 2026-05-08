@@ -11,7 +11,8 @@ use crate::gba::{
         BG0CNT, BG0HOFS, BG0VOFS, BG1CNT, BG1HOFS, BG1VOFS, BG2CNT, BG2HOFS, BG2VOFS, BG3CNT,
         BG3HOFS, BG3VOFS, DISPCNT, DISPSTAT, DMA0CNT, DMA0SAD, EWRAM_SIZE, EWRAM_START,
         GAME_PAK_ROM_START, IE, IF, IME, IO_START, IWRAM_SIZE, IWRAM_START, KEYINPUT, MOSAIC,
-        OAM_SIZE, OAM_START, PALETTE_SIZE, PALETTE_START, VCOUNT, VRAM_SIZE, VRAM_START,
+        OAM_SIZE, OAM_START, PALETTE_SIZE, PALETTE_START, VCOUNT, VRAM_SIZE, VRAM_START, WIN0H,
+        WIN0V, WIN1H, WIN1V, WININ, WINOUT,
     },
     ppu::{FrameBuffer, Ppu},
 };
@@ -117,6 +118,12 @@ impl KvmSharedMemory {
         ppu.write_bgvofs(1, self.read_io_u16(BG1VOFS));
         ppu.write_bgvofs(2, self.read_io_u16(BG2VOFS));
         ppu.write_bgvofs(3, self.read_io_u16(BG3VOFS));
+        ppu.write_winh(0, self.read_io_u16(WIN0H));
+        ppu.write_winh(1, self.read_io_u16(WIN1H));
+        ppu.write_winv(0, self.read_io_u16(WIN0V));
+        ppu.write_winv(1, self.read_io_u16(WIN1V));
+        ppu.write_winin(self.read_io_u16(WININ));
+        ppu.write_winout(self.read_io_u16(WINOUT));
         ppu.write_mosaic(self.read_io_u16(MOSAIC));
         ppu.render_frame(
             self.palette.as_slice(),
