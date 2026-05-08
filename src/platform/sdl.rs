@@ -10,10 +10,11 @@ const SDL_INIT_VIDEO: u32 = 0x0000_0020;
 const SDL_WINDOW_SHOWN: u32 = 0x0000_0004;
 const SDL_RENDERER_SOFTWARE: u32 = 0x0000_0001;
 const SDL_RENDERER_ACCELERATED: u32 = 0x0000_0002;
-const SDL_RENDERER_PRESENTVSYNC: u32 = 0x0000_0004;
 const SDL_TEXTUREACCESS_STREAMING: c_int = 1;
 const SDL_PIXELFORMAT_ARGB8888: u32 = 372645892;
 const SDL_QUIT: u32 = 0x100;
+const FRAME_INTERVAL: Duration = Duration::from_micros(16_742);
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 const SDL_SCANCODE_A: usize = 4;
 const SDL_SCANCODE_D: usize = 7;
@@ -122,11 +123,7 @@ impl Video {
                 return Err(sdl_error());
             }
 
-            let mut renderer = SDL_CreateRenderer(
-                window,
-                -1,
-                SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC,
-            );
+            let mut renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
             if renderer.is_null() {
                 renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
             }
@@ -196,6 +193,7 @@ impl Video {
         I: FnMut(u16),
     {
         let mut vcount = 0u16;
+        let mut next_present = Instant::now();
         loop {
             let (quit, keyinput) = self.poll_events_and_input();
             publish_input(keyinput);
@@ -203,9 +201,18 @@ impl Video {
                 return Ok(());
             }
 
-            let frame = next_frame(vcount);
-            self.present(&frame)?;
-            vcount = if vcount + 1 >= 228 { 0 } else { vcount + 1 };
+            let now = Instant::now();
+            if now >= next_present {
+                let frame = next_frame(vcount);
+                self.present(&frame)?;
+                vcount = if vcount + 1 >= 228 { 0 } else { vcount + 1 };
+                next_present += FRAME_INTERVAL;
+                if next_present < now {
+                    next_present = now + FRAME_INTERVAL;
+                }
+            }
+
+            std::thread::sleep(INPUT_POLL_INTERVAL);
         }
     }
 

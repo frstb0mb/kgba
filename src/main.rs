@@ -103,10 +103,19 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
     let mut video = Video::new("kgba - KVM mode 3")?;
     if let Some(duration_ms) = duration_ms {
         let started = Instant::now();
+        let mut next_present = Instant::now();
         while started.elapsed() < Duration::from_millis(duration_ms) {
             let (_, keyinput) = video.poll_events_and_input();
             shared.set_keyinput(keyinput);
-            video.present(&shared.render_frame())?;
+            let now = Instant::now();
+            if now >= next_present {
+                video.present(&shared.render_frame())?;
+                next_present += FRAME_INTERVAL;
+                if next_present < now {
+                    next_present = now + FRAME_INTERVAL;
+                }
+            }
+            std::thread::sleep(INPUT_POLL_INTERVAL);
         }
         stop.store(true, Ordering::Relaxed);
         return Ok(());
@@ -132,11 +141,23 @@ fn run_vcount_clock(shared: Arc<kgba::kvm::KvmSharedMemory>, stop: Arc<AtomicBoo
             vcount = 0;
         }
         next_tick += scanline;
-        while Instant::now() < next_tick {
-            std::hint::spin_loop();
+        loop {
+            let now = Instant::now();
+            if now >= next_tick {
+                break;
+            }
+            let remaining = next_tick.duration_since(now);
+            if remaining > Duration::from_micros(500) {
+                std::thread::sleep(remaining - Duration::from_micros(200));
+            } else {
+                std::hint::spin_loop();
+            }
         }
     }
 }
+
+const FRAME_INTERVAL: Duration = Duration::from_micros(16_742);
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 fn run_software(
     rom_path: &str,
