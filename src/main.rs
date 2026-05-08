@@ -67,10 +67,10 @@ fn run() -> Result<(), String> {
         return run_software(&rom_path, &cartridge, headless, duration_ms);
     }
 
-    run_kvm(&cartridge, duration_ms)
+    run_kvm(&cartridge, headless, duration_ms)
 }
 
-fn run_kvm(cartridge: &Cartridge, duration_ms: Option<u64>) -> Result<(), String> {
+fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> Result<(), String> {
     let machine = KvmGba::new(cartridge)?;
     let shared = machine.shared_memory();
     let stop = Arc::new(AtomicBool::new(false));
@@ -85,6 +85,20 @@ fn run_kvm(cartridge: &Cartridge, duration_ms: Option<u64>) -> Result<(), String
     });
 
     std::thread::spawn(move || run_vcount_clock(vcount_memory, vcount_stop));
+
+    if headless {
+        let duration_ms = duration_ms.unwrap_or(500);
+        std::thread::sleep(Duration::from_millis(duration_ms));
+        let frame = shared.render_frame();
+        let lit_pixels = frame.iter().filter(|&&pixel| pixel != 0xff000000).count();
+        let video = shared.debug_video_state();
+        println!(
+            "kgba kvm lit_pixels={} dispcnt={:#06x} bg2cnt={:#06x} mosaic={:#06x} dma3cnt={:#06x} vram0={:#06x}",
+            lit_pixels, video.dispcnt, video.bg2cnt, video.mosaic, video.dma3cnt, video.vram0
+        );
+        stop.store(true, Ordering::Relaxed);
+        return Ok(());
+    }
 
     let mut video = Video::new("kgba - KVM mode 3")?;
     if let Some(duration_ms) = duration_ms {

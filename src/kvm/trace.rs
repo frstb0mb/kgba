@@ -4,9 +4,10 @@ use std::{
         OnceLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
-use crate::gba::memory_map::IO_START;
+use crate::gba::memory_map::{DISPSTAT, IE, IF, IME, IO_START, KEYINPUT, MOSAIC};
 
 pub fn trace_timer_register_write(addr: u32, value: u16) {
     if trace_enabled("KGBA_TRACE_TIMER") {
@@ -48,6 +49,65 @@ pub fn trace_io_mmio(kind: &str, addr: u32, len: u32, data: &[u8; 8]) {
     );
 }
 
+pub fn trace_input_keyinput(value: u16) {
+    if trace_enabled("KGBA_TRACE_INPUT") {
+        eprintln!(
+            "kgba input t={} event=host_keyinput value={value:#06x}",
+            trace_micros()
+        );
+    }
+}
+
+pub fn trace_input_wait(bits: u16) {
+    if trace_enabled("KGBA_TRACE_INPUT") {
+        eprintln!(
+            "kgba input t={} event=swi_wait bits={bits:#06x}",
+            trace_micros()
+        );
+    }
+}
+
+pub fn trace_input_vblank(vcount: u16, ie: u16, iflag: u16, ime: u16, wait_bits: u16) {
+    if trace_enabled("KGBA_TRACE_INPUT") {
+        eprintln!(
+            "kgba input t={} event=vblank vcount={} ie={ie:#06x} if={iflag:#06x} ime={ime:#06x} wait={wait_bits:#06x}",
+            trace_micros(),
+            vcount
+        );
+    }
+}
+
+pub fn trace_input_irq_line(asserted: bool, ie: u16, iflag: u16, ime: u16) {
+    if trace_enabled("KGBA_TRACE_INPUT") {
+        eprintln!(
+            "kgba input t={} event=irq_line asserted={} ie={ie:#06x} if={iflag:#06x} ime={ime:#06x}",
+            trace_micros(),
+            asserted
+        );
+    }
+}
+
+pub fn trace_input_io_write(addr: u32, value: u16, keyinput: u16, vcount: u16) {
+    if !trace_enabled("KGBA_TRACE_INPUT") {
+        return;
+    }
+
+    let event = match addr {
+        DISPSTAT => "dispstat_write",
+        IE => "ie_write",
+        IF => "if_write",
+        IME => "ime_write",
+        MOSAIC => "mosaic_write",
+        KEYINPUT => "keyinput_write",
+        _ => return,
+    };
+    eprintln!(
+        "kgba input t={} event={} addr={addr:#010x} value={value:#06x} keyinput={keyinput:#06x} vcount={vcount}",
+        trace_micros(),
+        event
+    );
+}
+
 fn is_timer_register_access(addr: u32, len: u32) -> bool {
     let end = addr.saturating_add(len);
     addr < IO_START + 0x0110 && end > IO_START + 0x0100
@@ -64,10 +124,17 @@ fn format_mmio_data(data: &[u8; 8], len: u32) -> String {
 fn trace_enabled(name: &'static str) -> bool {
     static TIMER: OnceLock<bool> = OnceLock::new();
     static MMIO: OnceLock<bool> = OnceLock::new();
+    static INPUT: OnceLock<bool> = OnceLock::new();
 
     match name {
         "KGBA_TRACE_TIMER" => *TIMER.get_or_init(|| env::var_os(name).is_some()),
         "KGBA_TRACE_MMIO" => *MMIO.get_or_init(|| env::var_os(name).is_some()),
+        "KGBA_TRACE_INPUT" => *INPUT.get_or_init(|| env::var_os(name).is_some()),
         _ => false,
     }
+}
+
+fn trace_micros() -> u128 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_micros()
 }

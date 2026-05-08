@@ -17,7 +17,13 @@ use crate::gba::{
 };
 
 use super::{
-    memory::MemoryRegion, sys, timers::Timers, trace::trace_timer_register_write,
+    memory::MemoryRegion,
+    sys,
+    timers::Timers,
+    trace::{
+        trace_input_io_write, trace_input_irq_line, trace_input_keyinput, trace_input_vblank,
+        trace_input_wait, trace_timer_register_write,
+    },
     util::last_os_error,
 };
 
@@ -76,6 +82,13 @@ impl KvmSharedMemory {
             && dispstat & DISPSTAT_VBLANK != 0
             && dispstat & DISPSTAT_VBLANK_IRQ_ENABLE != 0
         {
+            trace_input_vblank(
+                value,
+                self.read_io_u16(IE),
+                self.read_io_u16(IF),
+                self.read_io_u16(IME),
+                self.interrupt_wait_bits.load(Ordering::Relaxed),
+            );
             self.request_interrupt(IRQ_VBLANK);
         }
     }
@@ -85,7 +98,11 @@ impl KvmSharedMemory {
     }
 
     pub fn set_keyinput(&self, value: u16) {
+        let old = self.read_io_u16(KEYINPUT);
         self.write_io_u16(KEYINPUT, value);
+        if old != value {
+            trace_input_keyinput(value);
+        }
     }
 
     pub fn render_frame(&self) -> FrameBuffer {
@@ -109,6 +126,16 @@ impl KvmSharedMemory {
             self.vram.as_slice(),
             self.oam.as_slice(),
         )
+    }
+
+    pub fn debug_video_state(&self) -> KvmVideoDebugState {
+        KvmVideoDebugState {
+            dispcnt: self.read_io_u16(DISPCNT),
+            bg2cnt: self.read_io_u16(BG2CNT),
+            mosaic: self.read_io_u16(MOSAIC),
+            dma3cnt: self.read_io_u16(DMA0CNT + 3 * 12 + 2),
+            vram0: u16::from_le_bytes([self.vram.as_slice()[0], self.vram.as_slice()[1]]),
+        }
     }
 
     pub(super) fn read_io_u16(&self, addr: u32) -> u16 {
@@ -135,12 +162,42 @@ impl KvmSharedMemory {
         self.io.as_mut_slice()[offset..offset + len].copy_from_slice(&data[..len]);
         if let Some(write) = if_write {
             self.write_io_u16(IF, old_if & !write.value);
+            trace_input_io_write(
+                IF,
+                self.read_io_u16(IF),
+                self.read_io_u16(KEYINPUT),
+                self.read_io_u16(VCOUNT),
+            );
         }
         if let Some(write) = dispstat_write {
             let writable = write.value & DISPSTAT_WRITABLE_MASK;
             let preserved = old_dispstat & !write.mask;
             let status = old_dispstat & DISPSTAT_STATUS_MASK;
             self.write_io_u16(DISPSTAT, status | preserved | writable);
+            trace_input_io_write(
+                DISPSTAT,
+                self.read_io_u16(DISPSTAT),
+                self.read_io_u16(KEYINPUT),
+                self.read_io_u16(VCOUNT),
+            );
+        }
+        for register in [IE, IME, MOSAIC] {
+            if let Some(write) = io_register_write(register, addr, len as u32, data) {
+                trace_input_io_write(
+                    register,
+                    write.value,
+                    self.read_io_u16(KEYINPUT),
+                    self.read_io_u16(VCOUNT),
+                );
+            }
+        }
+        if let Some(write) = io_register_write(KEYINPUT, addr, len as u32, data) {
+            trace_input_io_write(
+                KEYINPUT,
+                write.value,
+                self.read_io_u16(KEYINPUT),
+                self.read_io_u16(VCOUNT),
+            );
         }
         self.update_interrupt_line();
     }
@@ -160,6 +217,7 @@ impl KvmSharedMemory {
 
     pub(super) fn set_interrupt_wait_bits(&self, bits: u16) {
         self.interrupt_wait_bits.store(bits, Ordering::Relaxed);
+        trace_input_wait(bits);
     }
 
     pub(super) fn write_timer_registers_from_io(&self, addr: u32, len: u32) {
@@ -206,8 +264,7 @@ impl KvmSharedMemory {
         let master_enabled = self.read_io_u16(IME) & 1 != 0;
         let asserted = master_enabled && enabled & requested != 0;
         self.interrupt_line.set(asserted);
-        self.interrupt_line
-            .set(master_enabled && enabled & requested != 0);
+        trace_input_irq_line(asserted, enabled, requested, self.read_io_u16(IME));
     }
 
     fn run_immediate_dma_if_enabled(&self, addr: u32) {
@@ -290,6 +347,15 @@ impl KvmSharedMemory {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct KvmVideoDebugState {
+    pub dispcnt: u16,
+    pub bg2cnt: u16,
+    pub mosaic: u16,
+    pub dma3cnt: u16,
+    pub vram0: u16,
+}
+
 const DISPSTAT_VBLANK: u16 = 1 << 0;
 const DISPSTAT_STATUS_MASK: u16 = 0x0007;
 const DISPSTAT_WRITABLE_MASK: u16 = 0xff38;
@@ -370,7 +436,14 @@ fn io_register_write(
 
 #[cfg(test)]
 mod tests {
-    use super::{IoRegisterWrite, io_register_write};
+    use super::{
+        GAME_PAK_ROM_START, IoRegisterWrite, KvmSharedMemory, MOSAIC, PALETTE_SIZE, VRAM_SIZE,
+        io_register_write,
+    };
+    use crate::{
+        gba::memory_map::{DMA3CNT, DMA3DAD, DMA3SAD, EWRAM_SIZE, IWRAM_SIZE, OAM_SIZE},
+        kvm::memory::MemoryRegion,
+    };
 
     #[test]
     fn io_register_write_extracts_partial_halfword_write() {
@@ -391,6 +464,50 @@ mod tests {
             })
         );
         assert_eq!(io_register_write(0x0400_0202, 0x0400_0204, 2, &data), None);
+    }
+
+    #[test]
+    fn immediate_dma3_copies_mode3_bitmap_from_rom_to_vram() {
+        let count = 240 * 160;
+        let source_offset = 0x31c;
+        let mut rom = vec![0; source_offset + count * 2];
+        rom[source_offset..source_offset + 4].copy_from_slice(&[0x5f, 0x4a, 0x34, 0x12]);
+        let last_offset = source_offset + (count - 1) * 2;
+        rom[last_offset..last_offset + 2].copy_from_slice(&[0x1f, 0x00]);
+
+        let shared = test_shared_memory(&rom);
+        shared.write_io_u16(DMA3SAD, (GAME_PAK_ROM_START + source_offset as u32) as u16);
+        shared.write_io_u16(
+            DMA3SAD + 2,
+            ((GAME_PAK_ROM_START + source_offset as u32) >> 16) as u16,
+        );
+        shared.write_io_u16(DMA3DAD, 0);
+        shared.write_io_u16(DMA3DAD + 2, 0x0600);
+        shared.write_io_u16(DMA3CNT, count as u16);
+        shared.write_io_u16(DMA3CNT + 2, 0x8000);
+
+        shared.run_immediate_dma_for_io_write(DMA3CNT, 4);
+
+        assert_eq!(&shared.vram.as_slice()[0..4], &[0x5f, 0x4a, 0x34, 0x12]);
+        assert_eq!(
+            &shared.vram.as_slice()[(count - 1) * 2..count * 2],
+            &[0x1f, 0x00]
+        );
+        assert_eq!(shared.read_io_u16(DMA3CNT + 2) & 0x8000, 0);
+        assert_eq!(shared.read_io_u16(MOSAIC), 0);
+    }
+
+    fn test_shared_memory(rom: &[u8]) -> KvmSharedMemory {
+        KvmSharedMemory::new(
+            MemoryRegion::anonymous(EWRAM_SIZE).expect("ewram"),
+            MemoryRegion::anonymous(IWRAM_SIZE).expect("iwram"),
+            MemoryRegion::anonymous(0x1000).expect("io"),
+            MemoryRegion::anonymous(PALETTE_SIZE).expect("palette"),
+            MemoryRegion::anonymous(VRAM_SIZE).expect("vram"),
+            MemoryRegion::anonymous(OAM_SIZE).expect("oam"),
+            rom,
+            -1,
+        )
     }
 }
 
