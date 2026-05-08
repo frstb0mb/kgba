@@ -245,7 +245,7 @@ fn mode0_renders_4bpp_square_obj() {
         .copy_from_slice(&rgb5(31, 31, 31).to_le_bytes());
 
     let mut vram = vec![0; 0x18000];
-    vram[OBJ_TILE_BASE_TEXT_MODE + 32] = 0x11;
+    vram[OBJ_TILE_BASE + 32] = 0x11;
 
     let mut oam = vec![0; 0x400];
     write_oam_halfword(&mut oam, 0, 0);
@@ -261,6 +261,53 @@ fn mode0_renders_4bpp_square_obj() {
 }
 
 #[test]
+fn mode3_uses_bitmap_obj_tile_numbers_from_text_obj_base() {
+    let mut palette = vec![0; 0x400];
+    palette[OBJ_PALETTE_BASE + 2..OBJ_PALETTE_BASE + 4]
+        .copy_from_slice(&rgb5(31, 31, 31).to_le_bytes());
+
+    let mut vram = vec![0; 0x18000];
+    vram[OBJ_TILE_BASE + 512 * 32] = 0x11;
+
+    let mut oam = vec![0; 0x400];
+    write_oam_halfword(&mut oam, 0, 0);
+    write_oam_halfword(&mut oam, 2, 0);
+    write_oam_halfword(&mut oam, 4, 512);
+
+    let mut ppu = Ppu::new();
+    ppu.write_dispcnt(MODE_3 | BG2_ENABLE | OBJ_ENABLE | OBJ_1D_MAPPING);
+    let frame = ppu.render_frame(&palette, &vram, &oam);
+
+    assert_eq!(frame[0], 0xffffffff);
+}
+
+#[test]
+fn affine_obj_double_size_scales_source_pixels() {
+    let mut palette = vec![0; 0x400];
+    palette[OBJ_PALETTE_BASE + 2..OBJ_PALETTE_BASE + 4]
+        .copy_from_slice(&rgb5(31, 31, 31).to_le_bytes());
+
+    let mut vram = vec![0; 0x18000];
+    for tile in 0..4 {
+        vram[OBJ_TILE_BASE + tile * 32..OBJ_TILE_BASE + (tile + 1) * 32].fill(0x11);
+    }
+
+    let mut oam = vec![0; 0x400];
+    write_oam_halfword(&mut oam, 0, (1 << 8) | (1 << 9));
+    write_oam_halfword(&mut oam, 2, 1 << 14);
+    write_oam_halfword(&mut oam, 4, 0);
+    write_oam_halfword(&mut oam, 6, 0x0080);
+    write_oam_halfword(&mut oam, 30, 0x0080);
+
+    let mut ppu = Ppu::new();
+    ppu.write_dispcnt(MODE_0 | OBJ_ENABLE | OBJ_1D_MAPPING);
+    let frame = ppu.render_frame(&palette, &vram, &oam);
+
+    assert_eq!(frame[0], 0xffffffff);
+    assert_eq!(frame[24], 0xffffffff);
+}
+
+#[test]
 fn attr2_palette_bank_selects_obj_palette_row() {
     let mut palette = vec![0; 0x400];
     palette[OBJ_PALETTE_BASE + 2..OBJ_PALETTE_BASE + 4]
@@ -269,7 +316,7 @@ fn attr2_palette_bank_selects_obj_palette_row() {
         .copy_from_slice(&rgb5(0, 31, 0).to_le_bytes());
 
     let mut vram = vec![0; 0x18000];
-    vram[OBJ_TILE_BASE_TEXT_MODE] = 0x11;
+    vram[OBJ_TILE_BASE] = 0x11;
 
     let mut oam = vec![0; 0x400];
     write_oam_halfword(&mut oam, 0, 0);
@@ -292,8 +339,8 @@ fn attr2_priority_and_oam_index_control_obj_order() {
         .copy_from_slice(&rgb5(0, 31, 0).to_le_bytes());
 
     let mut vram = vec![0; 0x18000];
-    vram[OBJ_TILE_BASE_TEXT_MODE] = 0x11;
-    vram[OBJ_TILE_BASE_TEXT_MODE + 32] = 0x22;
+    vram[OBJ_TILE_BASE] = 0x11;
+    vram[OBJ_TILE_BASE + 32] = 0x22;
 
     let mut oam = vec![0; 0x400];
     write_oam_halfword(&mut oam, 0, 0);
@@ -319,7 +366,7 @@ fn obj_1d_mapping_uses_compact_rows() {
         .copy_from_slice(&rgb5(31, 31, 31).to_le_bytes());
 
     let mut vram = vec![0; 0x18000];
-    vram[OBJ_TILE_BASE_TEXT_MODE + 9 * 32] = 0x11;
+    vram[OBJ_TILE_BASE + 9 * 32] = 0x11;
 
     let mut oam = vec![0; 0x400];
     write_oam_halfword(&mut oam, 0, 0);

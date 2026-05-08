@@ -28,8 +28,7 @@ const SCREEN_BLOCK_SIZE: usize = 0x800;
 const CHAR_BLOCK_SIZE: usize = 0x4000;
 const MODE5_WIDTH: usize = 160;
 const MODE5_HEIGHT: usize = 128;
-const OBJ_TILE_BASE_TEXT_MODE: usize = 0x10000;
-const OBJ_TILE_BASE_BITMAP_MODE: usize = 0x14000;
+const OBJ_TILE_BASE: usize = 0x10000;
 const OBJ_PALETTE_BASE: usize = 0x200;
 
 impl Ppu {
@@ -186,7 +185,8 @@ impl Ppu {
             let attr1 = read_u16(oam, offset + 2);
             let attr2 = read_u16(oam, offset + 4);
 
-            if attr0 & (1 << 9) != 0 {
+            let affine = attr0 & (1 << 8) != 0;
+            if !affine && attr0 & (1 << 9) != 0 {
                 continue;
             }
             if ((attr0 >> 10) & 0x3) != 0 {
@@ -216,30 +216,51 @@ impl Ppu {
             let attr1 = obj.attr1;
             let attr2 = obj.attr2;
             let (obj_width, obj_height) = obj_size(attr0, attr1);
+            let affine = attr0 & (1 << 8) != 0;
+            let double_size = affine && attr0 & (1 << 9) != 0;
+            let (draw_width, draw_height) = if double_size {
+                (obj_width * 2, obj_height * 2)
+            } else {
+                (obj_width, obj_height)
+            };
             let obj_x = sign_extend(attr1 & 0x01ff, 9);
             let obj_y = sign_extend(attr0 & 0x00ff, 8);
             let tile_base = usize::from(attr2 & 0x03ff);
             let palette_bank = usize::from((attr2 >> 12) & 0x0f);
-            let tile_memory_base = self.obj_tile_memory_base();
+            let tile_memory_base = OBJ_TILE_BASE;
             let one_dimensional = self.dispcnt & OBJ_1D_MAPPING != 0;
             let row_stride = if one_dimensional { obj_width / 8 } else { 32 };
+            let affine_params =
+                affine.then(|| obj_affine_params(oam, usize::from((attr1 >> 9) & 0x1f)));
 
-            for y in 0..obj_height {
+            for y in 0..draw_height {
                 let screen_y = obj_y + y as i32;
                 if !(0..HEIGHT as i32).contains(&screen_y) {
                     continue;
                 }
 
-                for x in 0..obj_width {
+                for x in 0..draw_width {
                     let screen_x = obj_x + x as i32;
                     if !(0..WIDTH as i32).contains(&screen_x) {
                         continue;
                     }
 
-                    let tile_x = x / 8;
-                    let tile_y = y / 8;
+                    let Some((source_x, source_y)) = obj_source_pixel(
+                        x,
+                        y,
+                        obj_width,
+                        obj_height,
+                        draw_width,
+                        draw_height,
+                        affine_params,
+                    ) else {
+                        continue;
+                    };
+
+                    let tile_x = source_x / 8;
+                    let tile_y = source_y / 8;
                     let tile_number = tile_base + tile_y * row_stride + tile_x;
-                    let pixel_in_tile = (y % 8) * 8 + (x % 8);
+                    let pixel_in_tile = (source_y % 8) * 8 + (source_x % 8);
                     let color_index =
                         obj_4bpp_color(vram, tile_memory_base, tile_number, pixel_in_tile);
                     if color_index == 0 {
@@ -254,13 +275,6 @@ impl Ppu {
                         bgr555_to_argb8888(color);
                 }
             }
-        }
-    }
-
-    fn obj_tile_memory_base(&self) -> usize {
-        match self.dispcnt & DISPCNT_MODE_MASK {
-            MODE_0..=0x0002 => OBJ_TILE_BASE_TEXT_MODE,
-            _ => OBJ_TILE_BASE_BITMAP_MODE,
         }
     }
 
@@ -398,6 +412,51 @@ impl Obj {
     fn priority(self) -> u16 {
         (self.attr2 >> 10) & 0x3
     }
+}
+
+#[derive(Clone, Copy)]
+struct ObjAffineParams {
+    pa: i16,
+    pb: i16,
+    pc: i16,
+    pd: i16,
+}
+
+fn obj_affine_params(oam: &[u8], index: usize) -> ObjAffineParams {
+    let base = index * 32;
+    ObjAffineParams {
+        pa: read_u16_checked(oam, base + 6).unwrap_or(0x0100) as i16,
+        pb: read_u16_checked(oam, base + 14).unwrap_or(0) as i16,
+        pc: read_u16_checked(oam, base + 22).unwrap_or(0) as i16,
+        pd: read_u16_checked(oam, base + 30).unwrap_or(0x0100) as i16,
+    }
+}
+
+fn obj_source_pixel(
+    draw_x: usize,
+    draw_y: usize,
+    obj_width: usize,
+    obj_height: usize,
+    draw_width: usize,
+    draw_height: usize,
+    affine: Option<ObjAffineParams>,
+) -> Option<(usize, usize)> {
+    let Some(params) = affine else {
+        return Some((draw_x, draw_y));
+    };
+
+    let x = draw_x as i32 - (draw_width as i32 / 2);
+    let y = draw_y as i32 - (draw_height as i32 / 2);
+    let source_x =
+        ((i32::from(params.pa) * x + i32::from(params.pb) * y) >> 8) + (obj_width as i32 / 2);
+    let source_y =
+        ((i32::from(params.pc) * x + i32::from(params.pd) * y) >> 8) + (obj_height as i32 / 2);
+
+    if source_x < 0 || source_y < 0 || source_x >= obj_width as i32 || source_y >= obj_height as i32
+    {
+        return None;
+    }
+    Some((source_x as usize, source_y as usize))
 }
 
 fn obj_4bpp_color(vram: &[u8], base: usize, tile_number: usize, pixel_in_tile: usize) -> u8 {
