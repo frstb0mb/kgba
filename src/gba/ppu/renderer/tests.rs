@@ -62,6 +62,25 @@ fn mode3_applies_bg2_affine_scaling() {
 }
 
 #[test]
+fn mode3_applies_bg2_affine_rotation_terms() {
+    let mut vram = vec![0; WIDTH * HEIGHT * 2];
+    vram[WIDTH * 2..WIDTH * 2 + 2].copy_from_slice(&rgb5(31, 0, 0).to_le_bytes());
+    vram[2..4].copy_from_slice(&rgb5(0, 31, 0).to_le_bytes());
+
+    let mut ppu = Ppu::new();
+    ppu.write_dispcnt(MODE_3 | BG2_ENABLE);
+    ppu.write_bgpa(2, 0);
+    ppu.write_bgpb(2, 0x0100);
+    ppu.write_bgpc(2, 0x0100);
+    ppu.write_bgpd(2, 0);
+
+    let frame = ppu.render_mode3(&vram);
+
+    assert_eq!(frame[WIDTH], 0xff00ff00);
+    assert_eq!(frame[1], 0xffff0000);
+}
+
+#[test]
 fn mode4_uses_palette_and_selected_frame() {
     let mut palette = vec![0; 0x400];
     palette[2..4].copy_from_slice(&rgb5(31, 0, 0).to_le_bytes());
