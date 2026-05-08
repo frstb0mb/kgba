@@ -1,4 +1,6 @@
-use crate::gba::memory_map::{GAME_PAK_ROM_START, IWRAM_START};
+use crate::gba::memory_map::{
+    EWRAM_START, GAME_PAK_ROM_START, IWRAM_START, OAM_START, PALETTE_START, VRAM_START,
+};
 
 use super::{memory::MemoryRegion, util::clean_dcache_area};
 
@@ -23,6 +25,9 @@ const NORMAL_SHARED_WBWA_SECTION: u32 = SECTION_DESCRIPTOR
     | SECTION_AP_FULL_ACCESS
     | SECTION_TEX_WRITE_BACK_WRITE_ALLOCATE
     | SECTION_SHAREABLE;
+
+const NORMAL_SHARED_WRITE_THROUGH_SECTION: u32 =
+    SECTION_DESCRIPTOR | SECTION_CACHEABLE | SECTION_AP_FULL_ACCESS | SECTION_SHAREABLE;
 
 const CACHE_BOOTSTRAP: [u32; 15] = [
     0xe59f_0028, // ldr r0, [pc, #0x28] ; TTBR0
@@ -61,7 +66,15 @@ pub fn install_bios_and_cache_bootstrap(bios: &MemoryRegion, iwram: &MemoryRegio
         &mut iwram.as_mut_slice()[PAGE_TABLE_IWRAM_OFFSET..PAGE_TABLE_IWRAM_OFFSET + 0x4000];
     for section in 0..4096u32 {
         let base = section * SECTION_SIZE;
-        let entry = base | NORMAL_SHARED_WBWA_SECTION;
+        let attrs = if matches!(
+            base,
+            EWRAM_START | IWRAM_START | PALETTE_START | VRAM_START | OAM_START
+        ) {
+            NORMAL_SHARED_WRITE_THROUGH_SECTION
+        } else {
+            NORMAL_SHARED_WBWA_SECTION
+        };
+        let entry = base | attrs;
         let offset = section as usize * 4;
         table[offset..offset + 4].copy_from_slice(&entry.to_le_bytes());
     }
