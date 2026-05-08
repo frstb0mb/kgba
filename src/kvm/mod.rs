@@ -23,13 +23,8 @@ use crate::gba::{
 };
 
 use self::{
-    bootstrap::install_bios_and_cache_bootstrap,
-    fd::Fd,
-    memory::{MemoryRegion, MemorySlot},
-    regs::set_one_reg_u64,
-    run::RunMapping,
-    trace::trace_io_mmio,
-    util::last_os_error,
+    bootstrap::install_bios_and_cache_bootstrap, fd::Fd, memory::MemorySlot, regs::set_one_reg_u64,
+    run::RunMapping, trace::trace_io_mmio, util::last_os_error,
 };
 
 pub use self::shared_memory::KvmSharedMemory;
@@ -85,7 +80,13 @@ impl KvmGba {
             IWRAM_IRQ_MIRROR_SIZE,
             0,
         )?;
-        let io_region = MemoryRegion::anonymous(IO_SLOT_SIZE)?;
+        let io_slot = MemorySlot::anonymous(
+            vm_fd.raw(),
+            &mut slot_id,
+            IO_START,
+            IO_SLOT_SIZE,
+            sys::KVM_MEM_READONLY,
+        )?;
         let palette_slot = MemorySlot::anonymous(
             vm_fd.raw(),
             &mut slot_id,
@@ -108,7 +109,7 @@ impl KvmGba {
         let shared = Arc::new(KvmSharedMemory::new(
             ewram_slot.region.clone_for_shared(),
             iwram_slot.region.clone_for_shared(),
-            io_region.clone_for_shared(),
+            io_slot.region.clone_for_shared(),
             palette_slot.region.clone_for_shared(),
             vram_slot.region.clone_for_shared(),
             oam_slot.region.clone_for_shared(),
@@ -120,6 +121,7 @@ impl KvmGba {
         slots.push(ewram_slot);
         slots.push(iwram_slot);
         slots.push(iwram_irq_mirror_slot);
+        slots.push(io_slot);
         slots.push(palette_slot);
         slots.push(vram_slot);
         slots.push(oam_slot);
