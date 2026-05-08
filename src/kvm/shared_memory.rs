@@ -8,11 +8,11 @@ use std::{
 
 use crate::gba::{
     memory_map::{
-        BG0CNT, BG0HOFS, BG0VOFS, BG1CNT, BG1HOFS, BG1VOFS, BG2CNT, BG2HOFS, BG2VOFS, BG3CNT,
-        BG3HOFS, BG3VOFS, BLDALPHA, BLDCNT, BLDY, DISPCNT, DISPSTAT, DMA0CNT, DMA0SAD, EWRAM_SIZE,
-        EWRAM_START, GAME_PAK_ROM_START, IE, IF, IME, IO_START, IWRAM_SIZE, IWRAM_START, KEYINPUT,
-        MOSAIC, OAM_SIZE, OAM_START, PALETTE_SIZE, PALETTE_START, VCOUNT, VRAM_SIZE, VRAM_START,
-        WIN0H, WIN0V, WIN1H, WIN1V, WININ, WINOUT,
+        BG0CNT, BG0HOFS, BG0VOFS, BG1CNT, BG1HOFS, BG1VOFS, BG2CNT, BG2HOFS, BG2PA, BG2PB, BG2PC,
+        BG2PD, BG2VOFS, BG2X, BG2Y, BG3CNT, BG3HOFS, BG3VOFS, BLDALPHA, BLDCNT, BLDY, DISPCNT,
+        DISPSTAT, DMA0CNT, DMA0SAD, EWRAM_SIZE, EWRAM_START, GAME_PAK_ROM_START, IE, IF, IME,
+        IO_START, IWRAM_SIZE, IWRAM_START, KEYINPUT, MOSAIC, OAM_SIZE, OAM_START, PALETTE_SIZE,
+        PALETTE_START, VCOUNT, VRAM_SIZE, VRAM_START, WIN0H, WIN0V, WIN1H, WIN1V, WININ, WINOUT,
     },
     ppu::{FrameBuffer, Ppu},
 };
@@ -55,7 +55,7 @@ impl KvmSharedMemory {
         rom: &[u8],
         vm_fd: RawFd,
     ) -> Self {
-        Self {
+        let shared = Self {
             ewram,
             iwram,
             io,
@@ -65,7 +65,10 @@ impl KvmSharedMemory {
             rom: rom.to_vec().into_boxed_slice(),
             timers: Mutex::new(Timers::new()),
             interrupt_line: InterruptLine::new(vm_fd),
-        }
+        };
+        shared.write_io_u16(BG2PA, 0x0100);
+        shared.write_io_u16(BG2PD, 0x0100);
+        shared
     }
 
     pub fn set_vcount(&self, value: u16) {
@@ -118,6 +121,12 @@ impl KvmSharedMemory {
         ppu.write_bgvofs(1, self.read_io_u16(BG1VOFS));
         ppu.write_bgvofs(2, self.read_io_u16(BG2VOFS));
         ppu.write_bgvofs(3, self.read_io_u16(BG3VOFS));
+        ppu.write_bgpa(2, self.read_io_u16(BG2PA));
+        ppu.write_bgpb(2, self.read_io_u16(BG2PB));
+        ppu.write_bgpc(2, self.read_io_u16(BG2PC));
+        ppu.write_bgpd(2, self.read_io_u16(BG2PD));
+        ppu.write_bgx(2, self.read_io_u32(BG2X));
+        ppu.write_bgy(2, self.read_io_u32(BG2Y));
         ppu.write_winh(0, self.read_io_u16(WIN0H));
         ppu.write_winh(1, self.read_io_u16(WIN1H));
         ppu.write_winv(0, self.read_io_u16(WIN0V));

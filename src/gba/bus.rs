@@ -1,9 +1,10 @@
 use super::{
     memory::GbaMemory,
     memory_map::{
-        BG0CNT, BG0HOFS, BG0VOFS, BG1CNT, BG1HOFS, BG1VOFS, BG2CNT, BG2HOFS, BG2VOFS, BG3CNT,
-        BG3HOFS, BG3VOFS, BLDALPHA, BLDCNT, BLDY, DISPCNT, DISPSTAT, IO_SIZE, IO_START, KEYINPUT,
-        MOSAIC, VCOUNT, WIN0H, WIN0V, WIN1H, WIN1V, WININ, WINOUT,
+        BG0CNT, BG0HOFS, BG0VOFS, BG1CNT, BG1HOFS, BG1VOFS, BG2CNT, BG2HOFS, BG2PA, BG2PB, BG2PC,
+        BG2PD, BG2VOFS, BG2X, BG2Y, BG3CNT, BG3HOFS, BG3VOFS, BLDALPHA, BLDCNT, BLDY, DISPCNT,
+        DISPSTAT, IO_SIZE, IO_START, KEYINPUT, MOSAIC, VCOUNT, WIN0H, WIN0V, WIN1H, WIN1V, WININ,
+        WINOUT,
     },
     ppu::{FrameBuffer, Ppu},
 };
@@ -29,6 +30,13 @@ impl<'a> Bus<'a> {
         let keyinput_offset = (KEYINPUT - IO_START) as usize;
         io[keyinput_offset] = keyinput[0];
         io[keyinput_offset + 1] = keyinput[1];
+        let bg2pa_offset = (BG2PA - IO_START) as usize;
+        let bg2pd_offset = (BG2PD - IO_START) as usize;
+        let identity = 0x0100u16.to_le_bytes();
+        io[bg2pa_offset] = identity[0];
+        io[bg2pa_offset + 1] = identity[1];
+        io[bg2pd_offset] = identity[0];
+        io[bg2pd_offset + 1] = identity[1];
         Self {
             memory,
             ppu: Ppu::new(),
@@ -102,6 +110,14 @@ impl<'a> Bus<'a> {
             BG1VOFS => self.ppu.bgvofs(1),
             BG2VOFS => self.ppu.bgvofs(2),
             BG3VOFS => self.ppu.bgvofs(3),
+            BG2PA => self.ppu.bgpa(2),
+            BG2PB => self.ppu.bgpb(2),
+            BG2PC => self.ppu.bgpc(2),
+            BG2PD => self.ppu.bgpd(2),
+            BG2X => self.ppu.bgx(2) as u16,
+            addr if addr == BG2X + 2 => (self.ppu.bgx(2) >> 16) as u16,
+            BG2Y => self.ppu.bgy(2) as u16,
+            addr if addr == BG2Y + 2 => (self.ppu.bgy(2) >> 16) as u16,
             WIN0H => self.ppu.winh(0),
             WIN1H => self.ppu.winh(1),
             WIN0V => self.ppu.winv(0),
@@ -148,6 +164,14 @@ impl<'a> Bus<'a> {
             BG1VOFS => self.ppu.write_bgvofs(1, value),
             BG2VOFS => self.ppu.write_bgvofs(2, value),
             BG3VOFS => self.ppu.write_bgvofs(3, value),
+            BG2PA => self.ppu.write_bgpa(2, value),
+            BG2PB => self.ppu.write_bgpb(2, value),
+            BG2PC => self.ppu.write_bgpc(2, value),
+            BG2PD => self.ppu.write_bgpd(2, value),
+            BG2X => self.ppu.write_bgx_halfword(2, 0, value),
+            addr if addr == BG2X + 2 => self.ppu.write_bgx_halfword(2, 1, value),
+            BG2Y => self.ppu.write_bgy_halfword(2, 0, value),
+            addr if addr == BG2Y + 2 => self.ppu.write_bgy_halfword(2, 1, value),
             WIN0H => self.ppu.write_winh(0, value),
             WIN1H => self.ppu.write_winh(1, value),
             WIN0V => self.ppu.write_winv(0, value),
@@ -232,5 +256,22 @@ mod tests {
         assert_eq!(bus.read(BLDCNT, AccessSize::Halfword), 0x3fff);
         assert_eq!(bus.read(BLDALPHA, AccessSize::Halfword), 0x0808);
         assert_eq!(bus.read(BLDY, AccessSize::Halfword), 0x0010);
+    }
+
+    #[test]
+    fn bg2_affine_registers_accept_halfword_and_word_access() {
+        let mut memory = GbaMemory::new();
+        let mut bus = Bus::new(&mut memory);
+
+        assert_eq!(bus.read(BG2PA, AccessSize::Halfword), 0x0100);
+        assert_eq!(bus.read(BG2PD, AccessSize::Halfword), 0x0100);
+
+        bus.write(BG2PA, AccessSize::Halfword, 0x0200);
+        bus.write(BG2X, AccessSize::Word, 0x0001_8000);
+        bus.write(BG2Y, AccessSize::Word, 0x0fff_8000);
+
+        assert_eq!(bus.read(BG2PA, AccessSize::Halfword), 0x0200);
+        assert_eq!(bus.read(BG2X, AccessSize::Word), 0x0001_8000);
+        assert_eq!(bus.read(BG2Y, AccessSize::Word), 0x0fff_8000);
     }
 }

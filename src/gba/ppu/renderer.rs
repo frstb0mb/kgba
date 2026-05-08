@@ -106,7 +106,10 @@ impl Ppu {
 
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
-                let (source_x, source_y) = self.bg2_bitmap_source_pixel(x, y);
+                let Some((source_x, source_y)) = self.bg2_bitmap_source_pixel(x, y, WIDTH, HEIGHT)
+                else {
+                    continue;
+                };
                 let offset = (source_y * WIDTH + source_x) * 2;
                 let color = u16::from_le_bytes([vram[offset], vram[offset + 1]]);
                 frame[y * WIDTH + x] = bgr555_to_argb8888(color);
@@ -131,7 +134,10 @@ impl Ppu {
 
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
-                let (source_x, source_y) = self.bg2_bitmap_source_pixel(x, y);
+                let Some((source_x, source_y)) = self.bg2_bitmap_source_pixel(x, y, WIDTH, HEIGHT)
+                else {
+                    continue;
+                };
                 let color_index = usize::from(vram[page_offset + source_y * WIDTH + source_x]);
                 let palette_offset = color_index * 2;
                 let color =
@@ -158,9 +164,11 @@ impl Ppu {
 
         for y in 0..MODE5_HEIGHT {
             for x in 0..MODE5_WIDTH {
-                let (source_x, source_y) = self.bg2_bitmap_source_pixel(x, y);
-                let source_x = source_x.min(MODE5_WIDTH - 1);
-                let source_y = source_y.min(MODE5_HEIGHT - 1);
+                let Some((source_x, source_y)) =
+                    self.bg2_bitmap_source_pixel(x, y, MODE5_WIDTH, MODE5_HEIGHT)
+                else {
+                    continue;
+                };
                 let offset = page_offset + (source_y * MODE5_WIDTH + source_x) * 2;
                 let color = u16::from_le_bytes([vram[offset], vram[offset + 1]]);
                 frame[y * WIDTH + x] = bgr555_to_argb8888(color);
@@ -256,16 +264,36 @@ impl Ppu {
         }
     }
 
-    fn bg2_bitmap_source_pixel(&self, x: usize, y: usize) -> (usize, usize) {
-        if self.bgcnt[2] & BG_MOSAIC == 0 {
-            return (x, y);
-        }
+    fn bg2_bitmap_source_pixel(
+        &self,
+        x: usize,
+        y: usize,
+        bitmap_width: usize,
+        bitmap_height: usize,
+    ) -> Option<(usize, usize)> {
+        let (screen_x, screen_y) = if self.bgcnt[2] & BG_MOSAIC == 0 {
+            (x, y)
+        } else {
+            let (mosaic_width, mosaic_height) = bg_mosaic_size(self.mosaic);
+            (
+                x / mosaic_width * mosaic_width,
+                y / mosaic_height * mosaic_height,
+            )
+        };
 
-        let (mosaic_width, mosaic_height) = bg_mosaic_size(self.mosaic);
-        (
-            x / mosaic_width * mosaic_width,
-            y / mosaic_height * mosaic_height,
-        )
+        let source_x =
+            affine_source_coord(self.bgx[0], self.bgpa[0], self.bgpb[0], screen_x, screen_y);
+        let source_y =
+            affine_source_coord(self.bgy[0], self.bgpc[0], self.bgpd[0], screen_x, screen_y);
+
+        if source_x < 0
+            || source_y < 0
+            || source_x >= bitmap_width as i32
+            || source_y >= bitmap_height as i32
+        {
+            return None;
+        }
+        Some((source_x as usize, source_y as usize))
     }
 
     fn text_bg_pixel_raw(
@@ -457,6 +485,13 @@ fn bg_mosaic_size(mosaic: u16) -> (usize, usize) {
     )
 }
 
+fn affine_source_coord(reference: u32, x_step: u16, y_step: u16, x: usize, y: usize) -> i32 {
+    let reference = sign_extend_u32(reference & 0x0fff_ffff, 28) as i64;
+    let x_step = i64::from(x_step as i16);
+    let y_step = i64::from(y_step as i16);
+    ((reference + x_step * x as i64 + y_step * y as i64) >> 8) as i32
+}
+
 fn read_u16_checked(memory: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes([
         *memory.get(offset)?,
@@ -474,6 +509,15 @@ fn sign_extend(value: u16, bits: u32) -> i32 {
         i32::from(value) - (1 << bits)
     } else {
         i32::from(value)
+    }
+}
+
+fn sign_extend_u32(value: u32, bits: u32) -> i32 {
+    let sign_bit = 1u32 << (bits - 1);
+    if value & sign_bit != 0 {
+        value as i32 - (1 << bits)
+    } else {
+        value as i32
     }
 }
 

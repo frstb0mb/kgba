@@ -3,7 +3,7 @@ use super::{
     DISPSTAT_VCOUNT_SETTING_MASK, TOTAL_SCANLINES, VISIBLE_SCANLINES,
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Ppu {
     pub(super) dispcnt: u16,
     pub(super) dispstat: u16,
@@ -11,6 +11,12 @@ pub struct Ppu {
     pub(super) bgcnt: [u16; 4],
     pub(super) bghofs: [u16; 4],
     pub(super) bgvofs: [u16; 4],
+    pub(super) bgpa: [u16; 2],
+    pub(super) bgpb: [u16; 2],
+    pub(super) bgpc: [u16; 2],
+    pub(super) bgpd: [u16; 2],
+    pub(super) bgx: [u32; 2],
+    pub(super) bgy: [u32; 2],
     pub(super) winh: [u16; 2],
     pub(super) winv: [u16; 2],
     pub(super) winin: u16,
@@ -19,6 +25,33 @@ pub struct Ppu {
     pub(super) bldcnt: u16,
     pub(super) bldalpha: u16,
     pub(super) bldy: u16,
+}
+
+impl Default for Ppu {
+    fn default() -> Self {
+        Self {
+            dispcnt: 0,
+            dispstat: 0,
+            vcount: 0,
+            bgcnt: [0; 4],
+            bghofs: [0; 4],
+            bgvofs: [0; 4],
+            bgpa: [0x0100; 2],
+            bgpb: [0; 2],
+            bgpc: [0; 2],
+            bgpd: [0x0100; 2],
+            bgx: [0; 2],
+            bgy: [0; 2],
+            winh: [0; 2],
+            winv: [0; 2],
+            winin: 0,
+            winout: 0,
+            mosaic: 0,
+            bldcnt: 0,
+            bldalpha: 0,
+            bldy: 0,
+        }
+    }
 }
 
 impl Ppu {
@@ -70,6 +103,30 @@ impl Ppu {
         self.bgvofs[bg]
     }
 
+    pub fn bgpa(&self, bg: usize) -> u16 {
+        self.bgpa[bg - 2]
+    }
+
+    pub fn bgpb(&self, bg: usize) -> u16 {
+        self.bgpb[bg - 2]
+    }
+
+    pub fn bgpc(&self, bg: usize) -> u16 {
+        self.bgpc[bg - 2]
+    }
+
+    pub fn bgpd(&self, bg: usize) -> u16 {
+        self.bgpd[bg - 2]
+    }
+
+    pub fn bgx(&self, bg: usize) -> u32 {
+        self.bgx[bg - 2]
+    }
+
+    pub fn bgy(&self, bg: usize) -> u32 {
+        self.bgy[bg - 2]
+    }
+
     pub fn mosaic(&self) -> u16 {
         self.mosaic
     }
@@ -112,6 +169,52 @@ impl Ppu {
 
     pub fn write_bgvofs(&mut self, bg: usize, value: u16) {
         self.bgvofs[bg] = value & 0x01ff;
+    }
+
+    pub fn write_bgpa(&mut self, bg: usize, value: u16) {
+        self.bgpa[bg - 2] = value;
+    }
+
+    pub fn write_bgpb(&mut self, bg: usize, value: u16) {
+        self.bgpb[bg - 2] = value;
+    }
+
+    pub fn write_bgpc(&mut self, bg: usize, value: u16) {
+        self.bgpc[bg - 2] = value;
+    }
+
+    pub fn write_bgpd(&mut self, bg: usize, value: u16) {
+        self.bgpd[bg - 2] = value;
+    }
+
+    pub fn write_bgx(&mut self, bg: usize, value: u32) {
+        self.bgx[bg - 2] = value & 0x0fff_ffff;
+    }
+
+    pub fn write_bgy(&mut self, bg: usize, value: u32) {
+        self.bgy[bg - 2] = value & 0x0fff_ffff;
+    }
+
+    pub fn write_bgx_halfword(&mut self, bg: usize, halfword: usize, value: u16) {
+        let index = bg - 2;
+        let mut current = self.bgx[index];
+        if halfword == 0 {
+            current = (current & 0xffff_0000) | u32::from(value);
+        } else {
+            current = (current & 0x0000_ffff) | (u32::from(value) << 16);
+        }
+        self.write_bgx(bg, current);
+    }
+
+    pub fn write_bgy_halfword(&mut self, bg: usize, halfword: usize, value: u16) {
+        let index = bg - 2;
+        let mut current = self.bgy[index];
+        if halfword == 0 {
+            current = (current & 0xffff_0000) | u32::from(value);
+        } else {
+            current = (current & 0x0000_ffff) | (u32::from(value) << 16);
+        }
+        self.write_bgy(bg, current);
     }
 
     pub fn write_winh(&mut self, window: usize, value: u16) {

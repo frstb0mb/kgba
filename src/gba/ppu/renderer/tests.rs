@@ -44,6 +44,24 @@ fn mode3_applies_bg2_mosaic() {
 }
 
 #[test]
+fn mode3_applies_bg2_affine_scaling() {
+    let mut vram = vec![0; WIDTH * HEIGHT * 2];
+    vram[0..2].copy_from_slice(&rgb5(31, 0, 0).to_le_bytes());
+    vram[2..4].copy_from_slice(&rgb5(0, 31, 0).to_le_bytes());
+    vram[4..6].copy_from_slice(&rgb5(0, 0, 31).to_le_bytes());
+
+    let mut ppu = Ppu::new();
+    ppu.write_dispcnt(MODE_3 | BG2_ENABLE);
+    ppu.write_bgpa(2, 0x0200);
+    ppu.write_bgpd(2, 0x0100);
+
+    let frame = ppu.render_mode3(&vram);
+
+    assert_eq!(frame[0], 0xffff0000);
+    assert_eq!(frame[1], 0xff0000ff);
+}
+
+#[test]
 fn mode4_uses_palette_and_selected_frame() {
     let mut palette = vec![0; 0x400];
     palette[2..4].copy_from_slice(&rgb5(31, 0, 0).to_le_bytes());
