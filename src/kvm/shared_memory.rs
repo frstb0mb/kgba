@@ -2,7 +2,7 @@ use std::{
     os::fd::RawFd,
     sync::{
         Mutex,
-        atomic::{AtomicBool, AtomicU16, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -22,7 +22,7 @@ use super::{
     timers::Timers,
     trace::{
         trace_input_io_write, trace_input_irq_line, trace_input_keyinput, trace_input_vblank,
-        trace_input_wait, trace_timer_register_write,
+        trace_timer_register_write,
     },
     util::last_os_error,
 };
@@ -38,7 +38,6 @@ pub struct KvmSharedMemory {
     rom: Box<[u8]>,
     pub(super) timers: Mutex<Timers>,
     interrupt_line: InterruptLine,
-    interrupt_wait_bits: AtomicU16,
 }
 
 unsafe impl Send for KvmSharedMemory {}
@@ -65,7 +64,6 @@ impl KvmSharedMemory {
             rom: rom.to_vec().into_boxed_slice(),
             timers: Mutex::new(Timers::new()),
             interrupt_line: InterruptLine::new(vm_fd),
-            interrupt_wait_bits: AtomicU16::new(0),
         }
     }
 
@@ -87,7 +85,6 @@ impl KvmSharedMemory {
                 self.read_io_u16(IE),
                 self.read_io_u16(IF),
                 self.read_io_u16(IME),
-                self.interrupt_wait_bits.load(Ordering::Relaxed),
             );
             self.request_interrupt(IRQ_VBLANK);
         }
@@ -215,11 +212,6 @@ impl KvmSharedMemory {
         data[..len].copy_from_slice(&self.io.as_slice()[offset..offset + len]);
     }
 
-    pub(super) fn set_interrupt_wait_bits(&self, bits: u16) {
-        self.interrupt_wait_bits.store(bits, Ordering::Relaxed);
-        trace_input_wait(bits);
-    }
-
     pub(super) fn write_timer_registers_from_io(&self, addr: u32, len: u32) {
         let start = addr.max(IO_START + 0x0100);
         let end = (addr + len).min(IO_START + 0x0110);
@@ -247,13 +239,6 @@ impl KvmSharedMemory {
     }
 
     fn request_interrupt(&self, interrupt: u16) {
-        let wait_bits = self.interrupt_wait_bits.load(Ordering::Relaxed);
-        if wait_bits != 0 {
-            if wait_bits & interrupt == 0 {
-                return;
-            }
-            self.interrupt_wait_bits.store(0, Ordering::Relaxed);
-        }
         self.write_io_u16(IF, self.read_io_u16(IF) | interrupt);
         self.update_interrupt_line();
     }

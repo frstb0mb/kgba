@@ -58,19 +58,10 @@ pub fn trace_input_keyinput(value: u16) {
     }
 }
 
-pub fn trace_input_wait(bits: u16) {
+pub fn trace_input_vblank(vcount: u16, ie: u16, iflag: u16, ime: u16) {
     if trace_enabled("KGBA_TRACE_INPUT") {
         eprintln!(
-            "kgba input t={} event=swi_wait bits={bits:#06x}",
-            trace_micros()
-        );
-    }
-}
-
-pub fn trace_input_vblank(vcount: u16, ie: u16, iflag: u16, ime: u16, wait_bits: u16) {
-    if trace_enabled("KGBA_TRACE_INPUT") {
-        eprintln!(
-            "kgba input t={} event=vblank vcount={} ie={ie:#06x} if={iflag:#06x} ime={ime:#06x} wait={wait_bits:#06x}",
+            "kgba input t={} event=vblank vcount={} ie={ie:#06x} if={iflag:#06x} ime={ime:#06x}",
             trace_micros(),
             vcount
         );

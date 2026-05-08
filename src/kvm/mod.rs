@@ -35,7 +35,6 @@ const OAM_SLOT_SIZE: usize = 0x1000;
 const IWRAM_IRQ_MIRROR_START: u32 = 0x03ff_f000;
 const IWRAM_IRQ_MIRROR_OFFSET: usize = 0x7000;
 const IWRAM_IRQ_MIRROR_SIZE: usize = 0x1000;
-const INTR_WAIT_HYPERCALL: u32 = 0x0e01_0000;
 
 pub struct KvmGba {
     kvm_fd: Fd,
@@ -208,10 +207,7 @@ impl KvmGba {
 
     fn handle_mmio(&mut self) {
         let mmio = self.run.mmio();
-        if mmio.phys_addr == u64::from(INTR_WAIT_HYPERCALL) && mmio.is_write != 0 {
-            let bits = u16::from_le_bytes([mmio.data[0], mmio.data[1]]);
-            self.shared.set_interrupt_wait_bits(bits);
-        } else if mmio.phys_addr >= u64::from(IO_START)
+        if mmio.phys_addr >= u64::from(IO_START)
             && mmio.phys_addr < u64::from(IO_START + IO_SIZE as u32)
         {
             let addr = mmio.phys_addr as u32;

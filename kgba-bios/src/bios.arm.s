@@ -1,6 +1,9 @@
 .section .text.vector
 .global vector
 
+.equ REG_IRQ_WAITFLAGS, 0x03007ff8
+.equ REG_INTERRUPT_VECTOR, 0x03007ffc
+
 .org 0x0000
 vector:
     b reset
@@ -41,6 +44,8 @@ fiq_loop:
 swi_handler:
     ldrh r12, [lr, #-2]
     and r12, r12, #0xff
+    cmp r12, #4
+    beq intr_wait
     cmp r12, #5
     beq vblank_intr_wait
     cmp r12, #6
@@ -66,19 +71,37 @@ swi_return:
     movs pc, lr
 
 vblank_intr_wait:
-    ldr r0, [pc, #0x0c]
+    mov r0, #1
     mov r1, #1
-    strh r1, [r0]
+intr_wait:
+    ldr r2, reg_irq_waitflags_ptr
+    cmp r0, #0
+    beq intr_wait_loop
+    ldrh r3, [r2]
+    bic r3, r3, r1
+    strh r3, [r2]
+intr_wait_loop:
+    mrs r3, cpsr
+    bic r3, r3, #0x80
+    msr cpsr_c, r3
     wfi
+    mrs r3, cpsr
+    orr r3, r3, #0x80
+    msr cpsr_c, r3
+    ldrh r3, [r2]
+    tst r3, r1
+    beq intr_wait_loop
     movs pc, lr
-    .word 0x0e010000
+reg_irq_waitflags_ptr:
+    .word REG_IRQ_WAITFLAGS
 
-.org 0x0180
+.org 0x0200
 irq_handler:
     stmdb sp!, {r0-r3,r12,lr}
-    ldr r0, [pc, #0x0c]
+    ldr r0, reg_interrupt_vector_ptr
     add lr, pc, #0
     ldr pc, [r0]
     ldmia sp!, {r0-r3,r12,lr}
     subs pc, lr, #4
-    .word 0x03007ffc
+reg_interrupt_vector_ptr:
+    .word REG_INTERRUPT_VECTOR
