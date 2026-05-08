@@ -32,6 +32,9 @@ pub use self::shared_memory::KvmSharedMemory;
 const IO_SLOT_SIZE: usize = 0x1000;
 const PALETTE_SLOT_SIZE: usize = 0x1000;
 const OAM_SLOT_SIZE: usize = 0x1000;
+const IWRAM_IRQ_MIRROR_START: u32 = 0x03ff_f000;
+const IWRAM_IRQ_MIRROR_OFFSET: usize = 0x7000;
+const IWRAM_IRQ_MIRROR_SIZE: usize = 0x1000;
 
 pub struct KvmGba {
     kvm_fd: Fd,
@@ -68,6 +71,15 @@ impl KvmGba {
             MemorySlot::anonymous(vm_fd.raw(), &mut slot_id, EWRAM_START, EWRAM_SIZE, 0)?;
         let iwram_slot =
             MemorySlot::anonymous(vm_fd.raw(), &mut slot_id, IWRAM_START, IWRAM_SIZE, 0)?;
+        let iwram_irq_mirror_slot = MemorySlot::alias(
+            vm_fd.raw(),
+            &mut slot_id,
+            IWRAM_IRQ_MIRROR_START,
+            &iwram_slot.region,
+            IWRAM_IRQ_MIRROR_OFFSET,
+            IWRAM_IRQ_MIRROR_SIZE,
+            0,
+        )?;
         let io_slot = MemorySlot::anonymous(
             vm_fd.raw(),
             &mut slot_id,
@@ -108,6 +120,7 @@ impl KvmGba {
         slots.push(bios_slot);
         slots.push(ewram_slot);
         slots.push(iwram_slot);
+        slots.push(iwram_irq_mirror_slot);
         slots.push(io_slot);
         slots.push(palette_slot);
         slots.push(vram_slot);

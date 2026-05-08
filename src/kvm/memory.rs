@@ -43,6 +43,21 @@ impl MemorySlot {
         *next_slot += 1;
         Ok(Self { region })
     }
+
+    pub fn alias(
+        vm_fd: RawFd,
+        next_slot: &mut u32,
+        guest_addr: u32,
+        source: &MemoryRegion,
+        source_offset: usize,
+        size: usize,
+        flags: u32,
+    ) -> Result<Self, String> {
+        let region = source.alias(source_offset, size);
+        set_user_memory_region(vm_fd, *next_slot, flags, guest_addr, &region)?;
+        *next_slot += 1;
+        Ok(Self { region })
+    }
 }
 
 fn set_user_memory_region(
@@ -120,6 +135,15 @@ impl MemoryRegion {
         Self {
             ptr: self.ptr,
             len: self.len,
+            owned: false,
+        }
+    }
+
+    fn alias(&self, offset: usize, len: usize) -> Self {
+        assert!(offset + len <= self.len);
+        Self {
+            ptr: self.ptr_at(offset),
+            len,
             owned: false,
         }
     }
