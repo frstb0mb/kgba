@@ -16,6 +16,9 @@ pub struct Ppu {
     pub(super) winin: u16,
     pub(super) winout: u16,
     pub(super) mosaic: u16,
+    pub(super) bldcnt: u16,
+    pub(super) bldalpha: u16,
+    pub(super) bldy: u16,
 }
 
 impl Ppu {
@@ -71,6 +74,18 @@ impl Ppu {
         self.mosaic
     }
 
+    pub fn bldcnt(&self) -> u16 {
+        self.bldcnt
+    }
+
+    pub fn bldalpha(&self) -> u16 {
+        self.bldalpha
+    }
+
+    pub fn bldy(&self) -> u16 {
+        self.bldy
+    }
+
     pub fn winh(&self, window: usize) -> u16 {
         self.winh[window]
     }
@@ -117,6 +132,18 @@ impl Ppu {
 
     pub fn write_mosaic(&mut self, value: u16) {
         self.mosaic = value;
+    }
+
+    pub fn write_bldcnt(&mut self, value: u16) {
+        self.bldcnt = value & 0x3fff;
+    }
+
+    pub fn write_bldalpha(&mut self, value: u16) {
+        self.bldalpha = value & 0x1f1f;
+    }
+
+    pub fn write_bldy(&mut self, value: u16) {
+        self.bldy = value & 0x001f;
     }
 
     pub fn step_scanline(&mut self) {

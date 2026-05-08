@@ -12,9 +12,16 @@ const WIN_LAYER_BG1: u16 = 1 << 1;
 const WIN_LAYER_BG2: u16 = 1 << 2;
 const WIN_LAYER_BG3: u16 = 1 << 3;
 const WIN_LAYER_OBJ: u16 = 1 << 4;
+const WIN_LAYER_EFFECT: u16 = 1 << 5;
 const WIN_LAYER_ALL: u16 =
     WIN_LAYER_BG0 | WIN_LAYER_BG1 | WIN_LAYER_BG2 | WIN_LAYER_BG3 | WIN_LAYER_OBJ;
+const WIN_MASK_ALL: u16 = WIN_LAYER_ALL | WIN_LAYER_EFFECT;
 const WIN_LAYER_BG: [u16; 4] = [WIN_LAYER_BG0, WIN_LAYER_BG1, WIN_LAYER_BG2, WIN_LAYER_BG3];
+const BLEND_LAYER_BG: [u16; 4] = [1 << 0, 1 << 1, 1 << 2, 1 << 3];
+const BLEND_LAYER_BACKDROP: u16 = 1 << 5;
+const BLEND_MODE_ALPHA: u16 = 1;
+const BLEND_MODE_LIGHTEN: u16 = 2;
+const BLEND_MODE_DARKEN: u16 = 3;
 const BG_MOSAIC: u16 = 1 << 6;
 const BG_TILE_SIZE: usize = 8;
 const SCREEN_BLOCK_SIZE: usize = 0x800;
@@ -43,38 +50,47 @@ impl Ppu {
     }
 
     pub fn render_mode0(&self, palette: &[u8], vram: &[u8]) -> FrameBuffer {
-        let backdrop = read_u16_checked(palette, 0).map_or(0xff000000, bgr555_to_argb8888);
-        let mut frame = vec![backdrop; WIDTH * HEIGHT];
+        let backdrop = read_u16_checked(palette, 0).unwrap_or(0);
+        let mut frame = vec![bgr555_to_argb8888(backdrop); WIDTH * HEIGHT];
 
         if (self.dispcnt & DISPCNT_MODE_MASK) != MODE_0 {
             return frame;
         }
 
-        let mut bgs = [0usize, 1, 2, 3];
-        bgs.sort_by_key(|&bg| (self.bg_priority(bg), bg));
-
-        if !self.windows_enabled() {
-            for bg in bgs.into_iter().rev() {
-                if self.dispcnt & BG_ENABLE[bg] == 0 {
-                    continue;
-                }
-                self.render_text_bg(bg, palette, vram, &mut frame);
-            }
-            return frame;
-        }
+        let bg_order = self.sorted_bg_order();
+        let effects_enabled_everywhere = !self.windows_enabled();
 
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
-                let mask = self.window_mask(x, y);
-                for bg in bgs {
+                let mask = if self.windows_enabled() {
+                    self.window_mask(x, y)
+                } else {
+                    WIN_MASK_ALL
+                };
+                let mut layers = Vec::with_capacity(5);
+                for bg in bg_order {
                     if self.dispcnt & BG_ENABLE[bg] == 0 || mask & WIN_LAYER_BG[bg] == 0 {
                         continue;
                     }
-                    if let Some(color) = self.text_bg_pixel(bg, x, y, palette, vram) {
-                        frame[y * WIDTH + x] = color;
-                        break;
+                    if let Some(color) = self.text_bg_pixel_raw(bg, x, y, palette, vram) {
+                        layers.push(RenderedLayer {
+                            color,
+                            blend_layer: BLEND_LAYER_BG[bg],
+                        });
                     }
                 }
+                layers.push(RenderedLayer {
+                    color: backdrop,
+                    blend_layer: BLEND_LAYER_BACKDROP,
+                });
+
+                let effects_enabled = effects_enabled_everywhere || mask & WIN_LAYER_EFFECT != 0;
+                let color = if effects_enabled {
+                    self.apply_blend(layers[0], layers.get(1).copied())
+                } else {
+                    layers[0].color
+                };
+                frame[y * WIDTH + x] = bgr555_to_argb8888(color);
             }
         }
 
@@ -252,24 +268,14 @@ impl Ppu {
         )
     }
 
-    fn render_text_bg(&self, bg: usize, palette: &[u8], vram: &[u8], frame: &mut [u32]) {
-        for y in 0..HEIGHT {
-            for x in 0..WIDTH {
-                if let Some(color) = self.text_bg_pixel(bg, x, y, palette, vram) {
-                    frame[y * WIDTH + x] = color;
-                }
-            }
-        }
-    }
-
-    fn text_bg_pixel(
+    fn text_bg_pixel_raw(
         &self,
         bg: usize,
         screen_x: usize,
         screen_y: usize,
         palette: &[u8],
         vram: &[u8],
-    ) -> Option<u32> {
+    ) -> Option<u16> {
         let bgcnt = self.bgcnt[bg];
         let char_base = usize::from((bgcnt >> 2) & 0x3) * CHAR_BLOCK_SIZE;
         let screen_base = usize::from((bgcnt >> 8) & 0x1f) * SCREEN_BLOCK_SIZE;
@@ -283,11 +289,44 @@ impl Ppu {
         if color_index == 0 {
             return None;
         }
-        read_u16_checked(palette, usize::from(color_index) * 2).map(bgr555_to_argb8888)
+        read_u16_checked(palette, usize::from(color_index) * 2)
     }
 
     fn bg_priority(&self, bg: usize) -> u16 {
         self.bgcnt[bg] & 0x3
+    }
+
+    fn sorted_bg_order(&self) -> [usize; 4] {
+        let mut bgs = [0usize, 1, 2, 3];
+        bgs.sort_by_key(|&bg| (self.bg_priority(bg), bg));
+        bgs
+    }
+
+    fn apply_blend(&self, top: RenderedLayer, lower: Option<RenderedLayer>) -> u16 {
+        let mode = (self.bldcnt >> 6) & 0x3;
+        let top_targets = self.bldcnt & 0x003f;
+        let lower_targets = (self.bldcnt >> 8) & 0x003f;
+
+        if mode == 0 || top_targets & top.blend_layer == 0 {
+            return top.color;
+        }
+
+        match mode {
+            BLEND_MODE_ALPHA => {
+                let Some(lower) = lower else {
+                    return top.color;
+                };
+                if lower_targets & lower.blend_layer == 0 {
+                    return top.color;
+                }
+                let eva = (self.bldalpha & 0x001f).min(16);
+                let evb = ((self.bldalpha >> 8) & 0x001f).min(16);
+                alpha_blend(top.color, lower.color, eva, evb)
+            }
+            BLEND_MODE_LIGHTEN => brightness_blend(top.color, self.bldy & 0x001f, true),
+            BLEND_MODE_DARKEN => brightness_blend(top.color, self.bldy & 0x001f, false),
+            _ => top.color,
+        }
     }
 
     fn windows_enabled(&self) -> bool {
@@ -300,7 +339,7 @@ impl Ppu {
         } else if self.dispcnt & WIN1_ENABLE != 0 && self.window_contains(1, x, y) {
             (self.winin >> 8) & 0x003f
         } else {
-            self.winout & WIN_LAYER_ALL
+            self.winout & WIN_MASK_ALL
         }
     }
 
@@ -311,6 +350,12 @@ impl Ppu {
         let bottom = usize::from(self.winv[window] & 0xff).min(HEIGHT);
         x >= left && x < right && y >= top && y < bottom
     }
+}
+
+#[derive(Clone, Copy)]
+struct RenderedLayer {
+    color: u16,
+    blend_layer: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -374,7 +419,12 @@ fn text_bg_color_index(
 
     if is_8bpp {
         let tile_offset = char_base + tile_number * 64 + pixel_y * BG_TILE_SIZE + pixel_x;
-        vram.get(tile_offset).copied().map(u16::from)
+        let color = *vram.get(tile_offset)?;
+        if color == 0 {
+            None
+        } else {
+            Some(u16::from(color))
+        }
     } else {
         let tile_offset = char_base + tile_number * 32 + (pixel_y * BG_TILE_SIZE + pixel_x) / 2;
         let byte = *vram.get(tile_offset)?;
@@ -383,7 +433,11 @@ fn text_bg_color_index(
         } else {
             byte >> 4
         };
-        Some(((entry >> 12) & 0x0f) * 16 + u16::from(color))
+        if color == 0 {
+            None
+        } else {
+            Some(((entry >> 12) & 0x0f) * 16 + u16::from(color))
+        }
     }
 }
 
@@ -438,6 +492,29 @@ fn obj_size(attr0: u16, attr1: u16) -> (usize, usize) {
         (2, 2) => (16, 32),
         (2, 3) => (32, 64),
         _ => (8, 8),
+    }
+}
+
+fn alpha_blend(top: u16, lower: u16, eva: u16, evb: u16) -> u16 {
+    let r = ((((top & 0x001f) * eva) + ((lower & 0x001f) * evb)) / 16).min(31);
+    let g = (((((top >> 5) & 0x001f) * eva) + (((lower >> 5) & 0x001f) * evb)) / 16).min(31);
+    let b = (((((top >> 10) & 0x001f) * eva) + (((lower >> 10) & 0x001f) * evb)) / 16).min(31);
+    r | (g << 5) | (b << 10)
+}
+
+fn brightness_blend(color: u16, evy: u16, lighten: bool) -> u16 {
+    let evy = evy.min(16);
+    let r = brightness_channel(color & 0x001f, evy, lighten);
+    let g = brightness_channel((color >> 5) & 0x001f, evy, lighten);
+    let b = brightness_channel((color >> 10) & 0x001f, evy, lighten);
+    r | (g << 5) | (b << 10)
+}
+
+fn brightness_channel(channel: u16, evy: u16, lighten: bool) -> u16 {
+    if lighten {
+        channel + ((31 - channel) * evy) / 16
+    } else {
+        channel - (channel * evy) / 16
     }
 }
 
