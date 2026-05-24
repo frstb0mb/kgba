@@ -132,6 +132,7 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
         let started = Instant::now();
         let mut next_present = Instant::now();
         let mut present_count = 0u64;
+        let mut last_presented_seq = None;
         let mut last_keyinput = 0xffff;
         while started.elapsed() < Duration::from_millis(duration_ms) {
             let (_, keyinput) = video.poll_events_and_input();
@@ -139,12 +140,16 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
             trace_video_input(keyinput, &mut last_keyinput);
             let now = Instant::now();
             if now >= next_present {
-                shared.with_completed_frame(|seq, frame| {
-                    let present_duration = video.present_timed(frame)?;
+                let seq = shared.completed_frame_seq();
+                if last_presented_seq != Some(seq) {
+                    let snapshot = shared.latest_frame_snapshot();
+                    let present_duration = video.present_timed(&snapshot.pixels)?;
                     shared.record_sdl_present(present_duration);
-                    trace_video_frame(present_count, seq, frame, &shared);
-                    Ok::<(), String>(())
-                })?;
+                    trace_video_frame(present_count, snapshot.seq, &snapshot.pixels, &shared);
+                    last_presented_seq = Some(snapshot.seq);
+                } else {
+                    trace_video_frame_skip(present_count, seq);
+                }
                 present_count += 1;
                 next_present += FRAME_INTERVAL;
                 if next_present < now {
@@ -158,15 +163,20 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
     }
 
     let mut present_count = 0u64;
+    let mut last_presented_seq = None;
     let mut last_keyinput = 0xffff;
     let result = video.run_frame_loop(
         |video, _| {
-            shared.with_completed_frame(|seq, frame| {
-                let present_duration = video.present_timed(frame)?;
+            let seq = shared.completed_frame_seq();
+            if last_presented_seq != Some(seq) {
+                let snapshot = shared.latest_frame_snapshot();
+                let present_duration = video.present_timed(&snapshot.pixels)?;
                 shared.record_sdl_present(present_duration);
-                trace_video_frame(present_count, seq, frame, &shared);
-                Ok::<(), String>(())
-            })?;
+                trace_video_frame(present_count, snapshot.seq, &snapshot.pixels, &shared);
+                last_presented_seq = Some(snapshot.seq);
+            } else {
+                trace_video_frame_skip(present_count, seq);
+            }
             present_count += 1;
             Ok(())
         },
@@ -312,6 +322,12 @@ fn trace_video_frame(count: u64, seq: u64, frame: &[u16], shared: &kgba::kvm::Kv
             perf.kvm_mmio_exits,
             perf.sdl_present_us
         );
+    }
+}
+
+fn trace_video_frame_skip(count: u64, seq: u64) {
+    if env::var_os("KGBA_TRACE_VIDEO").is_some() && count.is_multiple_of(30) {
+        eprintln!("kgba video event=present_skip count={count} completed_seq={seq}");
     }
 }
 

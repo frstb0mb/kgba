@@ -1,7 +1,7 @@
 use std::{
     os::fd::RawFd,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -71,9 +71,9 @@ struct BgOffsetRaster {
 
 #[derive(Debug)]
 struct FrameBuffers {
-    buffers: [FrameBuffer; 2],
-    work_index: usize,
-    completed_index: usize,
+    work: FrameBuffer,
+    completed: Option<Arc<FrameBuffer>>,
+    spare: Option<FrameBuffer>,
     seq: u64,
 }
 
@@ -109,12 +109,18 @@ pub struct VideoPerfSnapshot {
     pub sdl_present_us: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct FrameSnapshot {
+    pub seq: u64,
+    pub pixels: Arc<FrameBuffer>,
+}
+
 impl Default for FrameBuffers {
     fn default() -> Self {
         Self {
-            buffers: [vec![0; WIDTH * HEIGHT], vec![0; WIDTH * HEIGHT]],
-            work_index: 0,
-            completed_index: 1,
+            work: vec![0; WIDTH * HEIGHT],
+            completed: Some(Arc::new(vec![0; WIDTH * HEIGHT])),
+            spare: Some(vec![0; WIDTH * HEIGHT]),
             seq: 0,
         }
     }
@@ -294,8 +300,7 @@ impl KvmSharedMemory {
             .frame_buffers
             .lock()
             .expect("frame buffers lock poisoned");
-        let work_index = frame_buffers.work_index;
-        frame_buffers.buffers[work_index][start..start + WIDTH].copy_from_slice(&line);
+        frame_buffers.work[start..start + WIDTH].copy_from_slice(&line);
         self.perf
             .render_scanline_us
             .fetch_add(duration_micros(started.elapsed()), Ordering::Relaxed);
@@ -306,8 +311,19 @@ impl KvmSharedMemory {
             .frame_buffers
             .lock()
             .expect("frame buffers lock poisoned");
-        frame_buffers.completed_index = frame_buffers.work_index;
-        frame_buffers.work_index = 1 - frame_buffers.completed_index;
+        let old_completed = frame_buffers
+            .completed
+            .take()
+            .expect("completed frame missing");
+        let next_work = match Arc::try_unwrap(old_completed) {
+            Ok(frame) => frame,
+            Err(_) => frame_buffers
+                .spare
+                .take()
+                .unwrap_or_else(|| vec![0; WIDTH * HEIGHT]),
+        };
+        let completed = std::mem::replace(&mut frame_buffers.work, next_work);
+        frame_buffers.completed = Some(Arc::new(completed));
         frame_buffers.seq = frame_buffers.seq.wrapping_add(1);
         self.completed_frame_seq
             .store(frame_buffers.seq, Ordering::Release);
@@ -320,10 +336,25 @@ impl KvmSharedMemory {
             .lock()
             .expect("frame buffers lock poisoned");
         let frame = frame_buffers
-            .buffers
-            .get(frame_buffers.completed_index)
-            .expect("completed frame index out of range");
-        f(frame_buffers.seq, frame)
+            .completed
+            .as_ref()
+            .expect("completed frame missing");
+        f(frame_buffers.seq, frame.as_slice())
+    }
+
+    pub fn latest_frame_snapshot(&self) -> FrameSnapshot {
+        let frame_buffers = self
+            .frame_buffers
+            .lock()
+            .expect("frame buffers lock poisoned");
+        let frame = frame_buffers
+            .completed
+            .as_ref()
+            .expect("completed frame missing");
+        FrameSnapshot {
+            seq: frame_buffers.seq,
+            pixels: Arc::clone(frame),
+        }
     }
 
     pub fn completed_frame_seq(&self) -> u64 {
