@@ -164,6 +164,24 @@ pub fn trace_hblank_wait_timeout(
     );
 }
 
+pub fn trace_hblank_wait(seq: u64, wait_us: u64, timeout: bool) {
+    if !trace_enabled("KGBA_TRACE_FASTIRQ") {
+        return;
+    }
+
+    static WAIT_LOGS: AtomicU64 = AtomicU64::new(0);
+    let log_index = WAIT_LOGS.fetch_add(1, Ordering::Relaxed);
+    if timeout || log_index < 32 || log_index.is_multiple_of(512) {
+        eprintln!(
+            "kgba fastirq t={} event=hblank_wait seq={} wait_us={} timeout={}",
+            trace_micros(),
+            seq,
+            wait_us,
+            timeout
+        );
+    }
+}
+
 fn is_timer_register_access(addr: u32, len: u32) -> bool {
     let end = addr.saturating_add(len);
     addr < IO_START + 0x0110 && end > IO_START + 0x0100

@@ -27,8 +27,9 @@ use super::{
     sys,
     timers::Timers,
     trace::{
-        trace_fast_hblank, trace_hblank_pending, trace_hblank_wait_timeout, trace_input_io_write,
-        trace_input_irq_line, trace_input_keyinput, trace_input_vblank, trace_timer_register_write,
+        trace_fast_hblank, trace_hblank_pending, trace_hblank_wait, trace_hblank_wait_timeout,
+        trace_input_io_write, trace_input_irq_line, trace_input_keyinput, trace_input_vblank,
+        trace_timer_register_write,
     },
     util::last_os_error,
 };
@@ -53,6 +54,7 @@ pub struct KvmSharedMemory {
     hblank_latch_vcount: AtomicU16,
     hblank_latch_seq: AtomicU64,
     hblank_pending_count: AtomicU64,
+    perf: VideoPerfCounters,
     interrupt_line: InterruptLine,
 }
 
@@ -79,6 +81,32 @@ struct FrameBuffers {
 struct HblankSync {
     requested_seq: AtomicU64,
     completed_seq: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct VideoPerfCounters {
+    frames: AtomicU64,
+    render_scanline_us: AtomicU64,
+    hblank_wait_us: AtomicU64,
+    hblank_wait_max_us: AtomicU64,
+    hblank_wait_timeouts: AtomicU64,
+    fast_hblank_us: AtomicU64,
+    fast_hblank_count: AtomicU64,
+    kvm_mmio_exits: AtomicU64,
+    sdl_present_us: AtomicU64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VideoPerfSnapshot {
+    pub frames: u64,
+    pub render_scanline_us: u64,
+    pub hblank_wait_us: u64,
+    pub hblank_wait_max_us: u64,
+    pub hblank_wait_timeouts: u64,
+    pub fast_hblank_us: u64,
+    pub fast_hblank_count: u64,
+    pub kvm_mmio_exits: u64,
+    pub sdl_present_us: u64,
 }
 
 impl Default for FrameBuffers {
@@ -134,6 +162,7 @@ impl KvmSharedMemory {
             hblank_latch_vcount: AtomicU16::new(0xffff),
             hblank_latch_seq: AtomicU64::new(0),
             hblank_pending_count: AtomicU64::new(0),
+            perf: VideoPerfCounters::default(),
             interrupt_line: InterruptLine::new(vm_fd),
         };
         shared.write_io_u16(BG2PA, 0x0100);
@@ -241,6 +270,7 @@ impl KvmSharedMemory {
             return;
         }
 
+        let started = Instant::now();
         let mut ppu = self.ppu_from_registers();
         {
             let bg_offset = self
@@ -266,6 +296,9 @@ impl KvmSharedMemory {
             .expect("frame buffers lock poisoned");
         let work_index = frame_buffers.work_index;
         frame_buffers.buffers[work_index][start..start + WIDTH].copy_from_slice(&line);
+        self.perf
+            .render_scanline_us
+            .fetch_add(duration_micros(started.elapsed()), Ordering::Relaxed);
     }
 
     pub fn publish_completed_frame(&self) {
@@ -278,6 +311,7 @@ impl KvmSharedMemory {
         frame_buffers.seq = frame_buffers.seq.wrapping_add(1);
         self.completed_frame_seq
             .store(frame_buffers.seq, Ordering::Release);
+        self.perf.frames.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn with_completed_frame<R>(&self, f: impl FnOnce(u64, &[u16]) -> R) -> R {
@@ -301,13 +335,20 @@ impl KvmSharedMemory {
     }
 
     pub fn wait_for_hblank_complete(&self, seq: u64, timeout: Duration) -> bool {
+        let started = Instant::now();
         let deadline = Instant::now() + timeout;
         loop {
             let completed_seq = self.hblank_sync.completed_seq.load(Ordering::Acquire);
             if completed_seq >= seq {
+                let wait_us = duration_micros(started.elapsed());
+                self.record_hblank_wait(wait_us, false);
+                trace_hblank_wait(seq, wait_us, false);
                 return true;
             }
             if Instant::now() >= deadline {
+                let wait_us = duration_micros(started.elapsed());
+                self.record_hblank_wait(wait_us, true);
+                trace_hblank_wait(seq, wait_us, true);
                 trace_hblank_wait_timeout(
                     seq,
                     completed_seq,
@@ -319,6 +360,44 @@ impl KvmSharedMemory {
                 return false;
             }
             std::thread::sleep(Duration::from_micros(5));
+        }
+    }
+
+    pub fn record_kvm_mmio_exit(&self) {
+        self.perf.kvm_mmio_exits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_sdl_present(&self, duration: Duration) {
+        self.perf
+            .sdl_present_us
+            .fetch_add(duration_micros(duration), Ordering::Relaxed);
+    }
+
+    pub fn take_video_perf_snapshot(&self) -> VideoPerfSnapshot {
+        VideoPerfSnapshot {
+            frames: self.perf.frames.swap(0, Ordering::Relaxed),
+            render_scanline_us: self.perf.render_scanline_us.swap(0, Ordering::Relaxed),
+            hblank_wait_us: self.perf.hblank_wait_us.swap(0, Ordering::Relaxed),
+            hblank_wait_max_us: self.perf.hblank_wait_max_us.swap(0, Ordering::Relaxed),
+            hblank_wait_timeouts: self.perf.hblank_wait_timeouts.swap(0, Ordering::Relaxed),
+            fast_hblank_us: self.perf.fast_hblank_us.swap(0, Ordering::Relaxed),
+            fast_hblank_count: self.perf.fast_hblank_count.swap(0, Ordering::Relaxed),
+            kvm_mmio_exits: self.perf.kvm_mmio_exits.swap(0, Ordering::Relaxed),
+            sdl_present_us: self.perf.sdl_present_us.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    fn record_hblank_wait(&self, wait_us: u64, timeout: bool) {
+        self.perf
+            .hblank_wait_us
+            .fetch_add(wait_us, Ordering::Relaxed);
+        self.perf
+            .hblank_wait_max_us
+            .fetch_max(wait_us, Ordering::Relaxed);
+        if timeout {
+            self.perf
+                .hblank_wait_timeouts
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -342,6 +421,7 @@ impl KvmSharedMemory {
     }
 
     pub fn finish_fast_hblank(&self) {
+        let started = Instant::now();
         self.write_fast_u32(FAST_CTRL_ADDR, FAST_CTRL_NONE);
         let ack = self.read_shadow_io_u16(IF) | IRQ_HBLANK;
         let bg1hofs = self.read_shadow_io_u16(BG1HOFS);
@@ -375,6 +455,10 @@ impl KvmSharedMemory {
         self.hblank_sync.completed_seq.store(seq, Ordering::Release);
         trace_fast_hblank(vcount, bg1hofs, ack);
         self.update_interrupt_line();
+        self.perf
+            .fast_hblank_us
+            .fetch_add(duration_micros(started.elapsed()), Ordering::Relaxed);
+        self.perf.fast_hblank_count.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn render_frame(&self) -> FrameBuffer {
@@ -904,6 +988,10 @@ fn io_register_write(
 
 fn fast_offset(addr: u32) -> usize {
     (addr - FAST_MEM_START) as usize
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]

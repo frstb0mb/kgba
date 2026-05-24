@@ -155,6 +155,11 @@ impl Video {
     }
 
     pub fn present(&mut self, frame: &[u16]) -> Result<(), String> {
+        self.present_timed(frame).map(|_| ())
+    }
+
+    pub fn present_timed(&mut self, frame: &[u16]) -> Result<Duration, String> {
+        let started = Instant::now();
         unsafe {
             if SDL_UpdateTexture(
                 self.texture,
@@ -169,7 +174,7 @@ impl Video {
             SDL_RenderCopy(self.renderer, self.texture, ptr::null(), ptr::null());
             SDL_RenderPresent(self.renderer);
         }
-        Ok(())
+        Ok(started.elapsed())
     }
 
     pub fn run_until_quit(&mut self, frame: &[u16], minimum: Duration) -> Result<(), String> {

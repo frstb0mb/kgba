@@ -140,8 +140,10 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
             let now = Instant::now();
             if now >= next_present {
                 shared.with_completed_frame(|seq, frame| {
-                    trace_video_frame(present_count, seq, frame);
-                    video.present(frame)
+                    let present_duration = video.present_timed(frame)?;
+                    shared.record_sdl_present(present_duration);
+                    trace_video_frame(present_count, seq, frame, &shared);
+                    Ok::<(), String>(())
                 })?;
                 present_count += 1;
                 next_present += FRAME_INTERVAL;
@@ -160,8 +162,10 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
     let result = video.run_frame_loop(
         |video, _| {
             shared.with_completed_frame(|seq, frame| {
-                trace_video_frame(present_count, seq, frame);
-                video.present(frame)
+                let present_duration = video.present_timed(frame)?;
+                shared.record_sdl_present(present_duration);
+                trace_video_frame(present_count, seq, frame, &shared);
+                Ok::<(), String>(())
             })?;
             present_count += 1;
             Ok(())
@@ -285,13 +289,28 @@ fn frame_hash(frame: &[u16]) -> u64 {
     })
 }
 
-fn trace_video_frame(count: u64, seq: u64, frame: &[u16]) {
+fn trace_video_frame(count: u64, seq: u64, frame: &[u16], shared: &kgba::kvm::KvmSharedMemory) {
     if env::var_os("KGBA_TRACE_VIDEO").is_some() && count.is_multiple_of(30) {
+        let perf = shared.take_video_perf_snapshot();
         eprintln!(
             "kgba video event=present count={} completed_seq={} frame_hash={:#018x}",
             count,
             seq,
             frame_hash(frame)
+        );
+        eprintln!(
+            "kgba video event=perf presents=30 frames={} completed_seq={} present_lag={} render_scanline_us={} hblank_wait_us={} hblank_wait_max_us={} hblank_timeouts={} fast_hblank_us={} fast_hblank_count={} mmio_exits={} sdl_present_us={}",
+            perf.frames,
+            seq,
+            count.saturating_sub(seq),
+            perf.render_scanline_us,
+            perf.hblank_wait_us,
+            perf.hblank_wait_max_us,
+            perf.hblank_wait_timeouts,
+            perf.fast_hblank_us,
+            perf.fast_hblank_count,
+            perf.kvm_mmio_exits,
+            perf.sdl_present_us
         );
     }
 }
