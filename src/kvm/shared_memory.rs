@@ -93,7 +93,17 @@ struct VideoPerfCounters {
     hblank_wait_timeouts: AtomicU64,
     fast_hblank_us: AtomicU64,
     fast_hblank_count: AtomicU64,
+    fast_hblank_shared_count: AtomicU64,
+    fast_hblank_mmio_count: AtomicU64,
     kvm_mmio_exits: AtomicU64,
+    kvm_mmio_fast_exit: AtomicU64,
+    kvm_mmio_io_reads: AtomicU64,
+    kvm_mmio_io_writes: AtomicU64,
+    kvm_mmio_io_if: AtomicU64,
+    kvm_mmio_io_ime: AtomicU64,
+    kvm_mmio_io_bg_hofs: AtomicU64,
+    kvm_mmio_io_bg_vofs: AtomicU64,
+    kvm_mmio_io_other: AtomicU64,
     sdl_present_us: AtomicU64,
 }
 
@@ -106,7 +116,17 @@ pub struct VideoPerfSnapshot {
     pub hblank_wait_timeouts: u64,
     pub fast_hblank_us: u64,
     pub fast_hblank_count: u64,
+    pub fast_hblank_shared_count: u64,
+    pub fast_hblank_mmio_count: u64,
     pub kvm_mmio_exits: u64,
+    pub kvm_mmio_fast_exit: u64,
+    pub kvm_mmio_io_reads: u64,
+    pub kvm_mmio_io_writes: u64,
+    pub kvm_mmio_io_if: u64,
+    pub kvm_mmio_io_ime: u64,
+    pub kvm_mmio_io_bg_hofs: u64,
+    pub kvm_mmio_io_bg_vofs: u64,
+    pub kvm_mmio_io_other: u64,
     pub sdl_present_us: u64,
 }
 
@@ -403,8 +423,50 @@ impl KvmSharedMemory {
         }
     }
 
-    pub fn record_kvm_mmio_exit(&self) {
+    pub fn record_kvm_mmio_exit(&self, addr: u32, is_write: bool, is_fast_exit: bool) {
         self.perf.kvm_mmio_exits.fetch_add(1, Ordering::Relaxed);
+        if is_fast_exit {
+            self.perf.kvm_mmio_fast_exit.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        if !(IO_START..IO_START + 0x400).contains(&addr) {
+            return;
+        }
+
+        if is_write {
+            self.perf
+                .kvm_mmio_io_writes
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.perf
+                .kvm_mmio_io_reads
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        match addr {
+            IF => {
+                self.perf.kvm_mmio_io_if.fetch_add(1, Ordering::Relaxed);
+            }
+            IME => {
+                self.perf.kvm_mmio_io_ime.fetch_add(1, Ordering::Relaxed);
+            }
+            BG0HOFS | BG1HOFS | BG2HOFS | BG3HOFS => {
+                self.perf
+                    .kvm_mmio_io_bg_hofs
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            BG0VOFS | BG1VOFS | BG2VOFS | BG3VOFS => {
+                self.perf
+                    .kvm_mmio_io_bg_vofs
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                self.perf
+                    .kvm_mmio_io_other
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     pub fn record_sdl_present(&self, duration: Duration) {
@@ -422,7 +484,23 @@ impl KvmSharedMemory {
             hblank_wait_timeouts: self.perf.hblank_wait_timeouts.swap(0, Ordering::Relaxed),
             fast_hblank_us: self.perf.fast_hblank_us.swap(0, Ordering::Relaxed),
             fast_hblank_count: self.perf.fast_hblank_count.swap(0, Ordering::Relaxed),
+            fast_hblank_shared_count: self
+                .perf
+                .fast_hblank_shared_count
+                .swap(0, Ordering::Relaxed),
+            fast_hblank_mmio_count: self
+                .perf
+                .fast_hblank_mmio_count
+                .swap(0, Ordering::Relaxed),
             kvm_mmio_exits: self.perf.kvm_mmio_exits.swap(0, Ordering::Relaxed),
+            kvm_mmio_fast_exit: self.perf.kvm_mmio_fast_exit.swap(0, Ordering::Relaxed),
+            kvm_mmio_io_reads: self.perf.kvm_mmio_io_reads.swap(0, Ordering::Relaxed),
+            kvm_mmio_io_writes: self.perf.kvm_mmio_io_writes.swap(0, Ordering::Relaxed),
+            kvm_mmio_io_if: self.perf.kvm_mmio_io_if.swap(0, Ordering::Relaxed),
+            kvm_mmio_io_ime: self.perf.kvm_mmio_io_ime.swap(0, Ordering::Relaxed),
+            kvm_mmio_io_bg_hofs: self.perf.kvm_mmio_io_bg_hofs.swap(0, Ordering::Relaxed),
+            kvm_mmio_io_bg_vofs: self.perf.kvm_mmio_io_bg_vofs.swap(0, Ordering::Relaxed),
+            kvm_mmio_io_other: self.perf.kvm_mmio_io_other.swap(0, Ordering::Relaxed),
             sdl_present_us: self.perf.sdl_present_us.swap(0, Ordering::Relaxed),
         }
     }
@@ -504,6 +582,9 @@ impl KvmSharedMemory {
             .fast_hblank_us
             .fetch_add(duration_micros(started.elapsed()), Ordering::Relaxed);
         self.perf.fast_hblank_count.fetch_add(1, Ordering::Relaxed);
+        self.perf
+            .fast_hblank_mmio_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn finish_fast_hblank_from_shared(&self, seq: u64) {
@@ -555,6 +636,9 @@ impl KvmSharedMemory {
             .fast_hblank_us
             .fetch_add(duration_micros(started.elapsed()), Ordering::Relaxed);
         self.perf.fast_hblank_count.fetch_add(1, Ordering::Relaxed);
+        self.perf
+            .fast_hblank_shared_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn render_frame(&self) -> FrameBuffer {

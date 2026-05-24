@@ -150,7 +150,7 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
                     trace_video_frame(present_count, snapshot.seq, &snapshot.pixels, &shared);
                     last_presented_seq = Some(snapshot.seq);
                 } else {
-                    trace_video_frame_skip(present_count, seq);
+                    trace_video_frame_skip(present_count, seq, &shared);
                 }
                 present_count += 1;
                 next_present += FRAME_INTERVAL;
@@ -177,7 +177,7 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
                 trace_video_frame(present_count, snapshot.seq, &snapshot.pixels, &shared);
                 last_presented_seq = Some(snapshot.seq);
             } else {
-                trace_video_frame_skip(present_count, seq);
+                trace_video_frame_skip(present_count, seq, &shared);
             }
             present_count += 1;
             Ok(())
@@ -303,34 +303,49 @@ fn frame_hash(frame: &[u16]) -> u64 {
 
 fn trace_video_frame(count: u64, seq: u64, frame: &[u16], shared: &kgba::kvm::KvmSharedMemory) {
     if env::var_os("KGBA_TRACE_VIDEO").is_some() && count.is_multiple_of(30) {
-        let perf = shared.take_video_perf_snapshot();
         eprintln!(
             "kgba video event=present count={} completed_seq={} frame_hash={:#018x}",
             count,
             seq,
             frame_hash(frame)
         );
-        eprintln!(
-            "kgba video event=perf presents=30 frames={} completed_seq={} present_lag={} render_scanline_us={} hblank_wait_us={} hblank_wait_max_us={} hblank_timeouts={} fast_hblank_us={} fast_hblank_count={} mmio_exits={} sdl_present_us={}",
-            perf.frames,
-            seq,
-            count.saturating_sub(seq),
-            perf.render_scanline_us,
-            perf.hblank_wait_us,
-            perf.hblank_wait_max_us,
-            perf.hblank_wait_timeouts,
-            perf.fast_hblank_us,
-            perf.fast_hblank_count,
-            perf.kvm_mmio_exits,
-            perf.sdl_present_us
-        );
+        trace_video_perf(count, seq, shared);
     }
 }
 
-fn trace_video_frame_skip(count: u64, seq: u64) {
+fn trace_video_frame_skip(count: u64, seq: u64, shared: &kgba::kvm::KvmSharedMemory) {
     if env::var_os("KGBA_TRACE_VIDEO").is_some() && count.is_multiple_of(30) {
         eprintln!("kgba video event=present_skip count={count} completed_seq={seq}");
+        trace_video_perf(count, seq, shared);
     }
+}
+
+fn trace_video_perf(count: u64, seq: u64, shared: &kgba::kvm::KvmSharedMemory) {
+    let perf = shared.take_video_perf_snapshot();
+    eprintln!(
+        "kgba video event=perf presents=30 frames={} completed_seq={} present_lag={} render_scanline_us={} hblank_wait_us={} hblank_wait_max_us={} hblank_timeouts={} fast_hblank_us={} fast_hblank_count={} fast_hblank_shared={} fast_hblank_mmio={} mmio_exits={} mmio_fast_exit={} mmio_io_reads={} mmio_io_writes={} mmio_io_if={} mmio_io_ime={} mmio_io_bg_hofs={} mmio_io_bg_vofs={} mmio_io_other={} sdl_present_us={}",
+        perf.frames,
+        seq,
+        count.saturating_sub(seq),
+        perf.render_scanline_us,
+        perf.hblank_wait_us,
+        perf.hblank_wait_max_us,
+        perf.hblank_wait_timeouts,
+        perf.fast_hblank_us,
+        perf.fast_hblank_count,
+        perf.fast_hblank_shared_count,
+        perf.fast_hblank_mmio_count,
+        perf.kvm_mmio_exits,
+        perf.kvm_mmio_fast_exit,
+        perf.kvm_mmio_io_reads,
+        perf.kvm_mmio_io_writes,
+        perf.kvm_mmio_io_if,
+        perf.kvm_mmio_io_ime,
+        perf.kvm_mmio_io_bg_hofs,
+        perf.kvm_mmio_io_bg_vofs,
+        perf.kvm_mmio_io_other,
+        perf.sdl_present_us
+    );
 }
 
 fn trace_video_input(keyinput: u16, last_keyinput: &mut u16) {

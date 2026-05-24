@@ -213,9 +213,14 @@ impl KvmGba {
     }
 
     fn handle_mmio(&mut self) {
-        self.shared.record_kvm_mmio_exit();
         let mmio = self.run.mmio();
-        if mmio.phys_addr == u64::from(FAST_EXIT_ADDR) && mmio.is_write != 0 {
+        let is_fast_exit = mmio.phys_addr == u64::from(FAST_EXIT_ADDR) && mmio.is_write != 0;
+        self.shared.record_kvm_mmio_exit(
+            mmio.phys_addr as u32,
+            mmio.is_write != 0,
+            is_fast_exit,
+        );
+        if is_fast_exit {
             self.shared.finish_fast_hblank();
         } else if mmio.phys_addr >= u64::from(IO_START)
             && mmio.phys_addr < u64::from(IO_START + IO_SIZE as u32)
