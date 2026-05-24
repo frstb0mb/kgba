@@ -21,7 +21,7 @@ const SECTION_SIZE: u32 = 0x0010_0000;
 const TTBR0_INNER_SHAREABLE_WBWA: u32 = (1 << 6) | (1 << 3) | (1 << 1);
 const TTBR0_VALUE: u32 = NORMAL_L1_ADDR | TTBR0_INNER_SHAREABLE_WBWA;
 const KVM_RESET_VECTOR_OFFSET: usize = 0;
-const KVM_RESET_HANDLER_OFFSET: usize = 0x300;
+const KVM_RESET_HANDLER_OFFSET: usize = 0x400;
 
 const SECTION_DESCRIPTOR: u32 = 0b10;
 const SECTION_BUFFERABLE: u32 = 1 << 2;
@@ -79,7 +79,7 @@ const CACHE_BOOTSTRAP: [u32; 19] = [
     GAME_PAK_ROM_START,
 ];
 
-const KVM_RESET_VECTOR: u32 = 0xea00_00be; // reset -> 0x300
+const KVM_RESET_VECTOR: u32 = 0xea00_00fe; // reset -> 0x400
 
 pub fn install_bios_and_cache_bootstrap(
     bios: &MemoryRegion,

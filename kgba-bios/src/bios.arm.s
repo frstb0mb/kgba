@@ -4,7 +4,16 @@
 .equ REG_IRQ_WAITFLAGS, 0x03007ff8
 .equ REG_INTERRUPT_VECTOR, 0x03007ffc
 .equ REG_IF, 0x04000202
-.equ FAST_EXIT, 0x040003fc
+.equ REG_IME, 0x04000208
+.equ REG_BG0HOFS, 0x04000010
+.equ REG_BG0VOFS, 0x04000012
+.equ REG_BG1HOFS, 0x04000014
+.equ REG_BG1VOFS, 0x04000016
+.equ REG_BG2HOFS, 0x04000018
+.equ REG_BG2VOFS, 0x0400001a
+.equ REG_BG3HOFS, 0x0400001c
+.equ REG_BG3VOFS, 0x0400001e
+.equ FAST_HBLANK_STATE, 0x0f00a000
 .equ NORMAL_CONTEXTIDR, 0x00000001
 .equ HBLANK_CONTEXTIDR, 0x00000002
 .equ HBLANK_TTBR0, 0x0f00404a
@@ -139,6 +148,49 @@ irq_handler_fast_hblank:
     add lr, pc, #0
     ldr pc, [r0]
 
+    ldr r12, fast_hblank_state_ptr
+    mov r2, #0
+    str r2, [r12]
+    ldr r2, hblank_dirty_mask
+    str r2, [r12, #24]
+    ldr r0, reg_bg0hofs_ptr
+    ldrh r1, [r0]
+    strh r1, [r12, #28]
+    ldr r0, reg_bg1hofs_ptr
+    ldrh r1, [r0]
+    strh r1, [r12, #30]
+    ldr r0, reg_bg2hofs_ptr
+    ldrh r1, [r0]
+    strh r1, [r12, #32]
+    ldr r0, reg_bg3hofs_ptr
+    ldrh r1, [r0]
+    strh r1, [r12, #34]
+    ldr r0, reg_bg0vofs_ptr
+    ldrh r1, [r0]
+    strh r1, [r12, #36]
+    ldr r0, reg_bg1vofs_ptr
+    ldrh r1, [r0]
+    strh r1, [r12, #38]
+    ldr r0, reg_bg2vofs_ptr
+    ldrh r1, [r0]
+    strh r1, [r12, #40]
+    ldr r0, reg_bg3vofs_ptr
+    ldrh r1, [r0]
+    strh r1, [r12, #42]
+    ldr r0, reg_ime_ptr
+    ldrh r1, [r0]
+    strh r1, [r12, #44]
+    ldr r0, reg_if_ptr
+    ldrh r1, [r0]
+    orr r1, r1, #2
+    strh r1, [r12, #46]
+    ldr r0, [r12, #4]
+    ldr r1, [r12, #8]
+    dsb sy
+    str r0, [r12, #12]
+    str r1, [r12, #16]
+    dsb sy
+
     ldmia sp!, {r2-r3}
     mcr p15, 0, r3, c13, c0, 1
     mcr p15, 0, r2, c2, c0, 0
@@ -147,17 +199,34 @@ irq_handler_fast_hblank:
     dsb sy
     isb sy
 
-    ldr r0, fast_exit_ptr
-    mov r1, #1
-    str r1, [r0]
     b irq_handler_return
 
 reg_interrupt_vector_ptr:
     .word REG_INTERRUPT_VECTOR
 reg_if_ptr:
     .word REG_IF
-fast_exit_ptr:
-    .word FAST_EXIT
+reg_ime_ptr:
+    .word REG_IME
+reg_bg0hofs_ptr:
+    .word REG_BG0HOFS
+reg_bg0vofs_ptr:
+    .word REG_BG0VOFS
+reg_bg1hofs_ptr:
+    .word REG_BG1HOFS
+reg_bg1vofs_ptr:
+    .word REG_BG1VOFS
+reg_bg2hofs_ptr:
+    .word REG_BG2HOFS
+reg_bg2vofs_ptr:
+    .word REG_BG2VOFS
+reg_bg3hofs_ptr:
+    .word REG_BG3HOFS
+reg_bg3vofs_ptr:
+    .word REG_BG3VOFS
+fast_hblank_state_ptr:
+    .word FAST_HBLANK_STATE
+hblank_dirty_mask:
+    .word 0x000003ff
 hblank_contextidr_ptr:
     .word HBLANK_CONTEXTIDR
 hblank_ttbr0_ptr:

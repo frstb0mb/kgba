@@ -1,5 +1,6 @@
 use std::{
     os::fd::RawFd,
+    ptr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
@@ -376,13 +377,21 @@ impl KvmSharedMemory {
                 trace_hblank_wait(seq, wait_us, false);
                 return true;
             }
+            let shared_completed_seq = self.read_fast_hblank_u64(FAST_HBLANK_COMPLETED_SEQ_OFFSET);
+            if shared_completed_seq >= seq {
+                self.finish_fast_hblank_from_shared(seq);
+                let wait_us = duration_micros(started.elapsed());
+                self.record_hblank_wait(wait_us, false);
+                trace_hblank_wait(seq, wait_us, false);
+                return true;
+            }
             if Instant::now() >= deadline {
                 let wait_us = duration_micros(started.elapsed());
                 self.record_hblank_wait(wait_us, true);
                 trace_hblank_wait(seq, wait_us, true);
                 trace_hblank_wait_timeout(
                     seq,
-                    completed_seq,
+                    completed_seq.max(shared_completed_seq),
                     self.read_io_u16(VCOUNT),
                     self.read_io_u16(IE),
                     self.read_io_u16(IF),
@@ -445,15 +454,20 @@ impl KvmSharedMemory {
         let shadow_offset = fast_offset(SHADOW_IO_ADDR);
         self.fast.as_mut_slice()[shadow_offset..shadow_offset + io_len]
             .copy_from_slice(self.io.as_slice());
+        let seq = self.hblank_latch_seq.load(Ordering::Acquire);
+        self.write_fast_hblank_u64(FAST_HBLANK_REQUESTED_SEQ_OFFSET, seq);
+        self.write_fast_hblank_u64(FAST_HBLANK_COMPLETED_SEQ_OFFSET, 0);
+        self.write_fast_hblank_u16(FAST_HBLANK_VCOUNT_OFFSET, vcount);
+        self.write_fast_hblank_u32(FAST_HBLANK_DIRTY_MASK_OFFSET, 0);
         self.write_shadow_io_u16(VCOUNT, vcount);
         self.write_shadow_io_u16(IF, self.read_io_u16(IF) | IRQ_HBLANK);
         self.write_shadow_io_u16(DISPSTAT, self.read_io_u16(DISPSTAT) | DISPSTAT_HBLANK);
-        self.write_fast_u32(FAST_CTRL_ADDR, FAST_CTRL_HBLANK);
+        self.write_fast_hblank_u32(FAST_HBLANK_KIND_OFFSET, FAST_CTRL_HBLANK);
     }
 
     pub fn finish_fast_hblank(&self) {
         let started = Instant::now();
-        self.write_fast_u32(FAST_CTRL_ADDR, FAST_CTRL_NONE);
+        self.write_fast_hblank_u32(FAST_HBLANK_KIND_OFFSET, FAST_CTRL_NONE);
         let ack = self.read_shadow_io_u16(IF) | IRQ_HBLANK;
         let bg1hofs = self.read_shadow_io_u16(BG1HOFS);
         let vcount = self.hblank_latch_vcount.load(Ordering::Relaxed);
@@ -483,6 +497,57 @@ impl KvmSharedMemory {
         }
         drop(bg_offset);
         let seq = self.hblank_latch_seq.load(Ordering::Acquire);
+        self.hblank_sync.completed_seq.store(seq, Ordering::Release);
+        trace_fast_hblank(vcount, bg1hofs, ack);
+        self.update_interrupt_line();
+        self.perf
+            .fast_hblank_us
+            .fetch_add(duration_micros(started.elapsed()), Ordering::Relaxed);
+        self.perf.fast_hblank_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn finish_fast_hblank_from_shared(&self, seq: u64) {
+        let started = Instant::now();
+        self.write_fast_hblank_u32(FAST_HBLANK_KIND_OFFSET, FAST_CTRL_NONE);
+        let dirty_mask = self.read_fast_hblank_u32(FAST_HBLANK_DIRTY_MASK_OFFSET);
+        let ack = if dirty_mask & FAST_HBLANK_DIRTY_IF_ACK != 0 {
+            self.read_fast_hblank_u16(FAST_HBLANK_IF_ACK_OFFSET)
+        } else {
+            IRQ_HBLANK
+        };
+        let bg1hofs = self.read_fast_hblank_u16(FAST_HBLANK_BG_HOFS_OFFSET + 2);
+        let vcount = self.read_fast_hblank_u16(FAST_HBLANK_VCOUNT_OFFSET);
+        self.write_io_u16(IF, self.read_io_u16(IF) & !ack);
+        if dirty_mask & FAST_HBLANK_DIRTY_IME != 0 {
+            self.write_io_u16(IME, self.read_fast_hblank_u16(FAST_HBLANK_IME_OFFSET));
+        }
+
+        let target_line = self.hblank_target_line();
+        let mut bg_offset = self
+            .bg_offset_scanline
+            .lock()
+            .expect("bg offset scanline lock poisoned");
+        for index in 0..4 {
+            if dirty_mask & (FAST_HBLANK_DIRTY_BG_HOFS0 << index) != 0 {
+                let value = self.read_fast_hblank_u16(FAST_HBLANK_BG_HOFS_OFFSET + index * 2);
+                self.write_io_u16([BG0HOFS, BG1HOFS, BG2HOFS, BG3HOFS][index], value);
+                if let Some(line) = target_line {
+                    bg_offset.hofs[index][line] = value;
+                    self.bghofs_scanline_active[index].store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        for index in 0..4 {
+            if dirty_mask & (FAST_HBLANK_DIRTY_BG_VOFS0 << index) != 0 {
+                let value = self.read_fast_hblank_u16(FAST_HBLANK_BG_VOFS_OFFSET + index * 2);
+                self.write_io_u16([BG0VOFS, BG1VOFS, BG2VOFS, BG3VOFS][index], value);
+                if let Some(line) = target_line {
+                    bg_offset.vofs[index][line] = value;
+                    self.bgvofs_scanline_active[index].store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        drop(bg_offset);
         self.hblank_sync.completed_seq.store(seq, Ordering::Release);
         trace_fast_hblank(vcount, bg1hofs, ack);
         self.update_interrupt_line();
@@ -701,9 +766,39 @@ impl KvmSharedMemory {
         fast[offset + 1] = bytes[1];
     }
 
-    fn write_fast_u32(&self, addr: u32, value: u32) {
-        let offset = fast_offset(addr);
-        self.fast.as_mut_slice()[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    fn read_fast_hblank_u16(&self, offset: usize) -> u16 {
+        let base = fast_offset(FAST_CTRL_ADDR) + offset;
+        let fast = self.fast.as_slice();
+        unsafe { ptr::read_volatile(fast.as_ptr().add(base).cast::<u16>()) }
+    }
+
+    fn read_fast_hblank_u32(&self, offset: usize) -> u32 {
+        let base = fast_offset(FAST_CTRL_ADDR) + offset;
+        let fast = self.fast.as_slice();
+        unsafe { ptr::read_volatile(fast.as_ptr().add(base).cast::<u32>()) }
+    }
+
+    fn read_fast_hblank_u64(&self, offset: usize) -> u64 {
+        let low = u64::from(self.read_fast_hblank_u32(offset));
+        let high = u64::from(self.read_fast_hblank_u32(offset + 4));
+        low | (high << 32)
+    }
+
+    fn write_fast_hblank_u16(&self, offset: usize, value: u16) {
+        let base = fast_offset(FAST_CTRL_ADDR) + offset;
+        let fast = self.fast.as_mut_slice();
+        unsafe { ptr::write_volatile(fast.as_mut_ptr().add(base).cast::<u16>(), value) };
+    }
+
+    fn write_fast_hblank_u32(&self, offset: usize, value: u32) {
+        let base = fast_offset(FAST_CTRL_ADDR) + offset;
+        let fast = self.fast.as_mut_slice();
+        unsafe { ptr::write_volatile(fast.as_mut_ptr().add(base).cast::<u32>(), value) };
+    }
+
+    fn write_fast_hblank_u64(&self, offset: usize, value: u64) {
+        self.write_fast_hblank_u32(offset, value as u32);
+        self.write_fast_hblank_u32(offset + 4, (value >> 32) as u32);
     }
 
     pub(super) fn mirror_io_write(&self, addr: u32, len: u32, data: &[u8; 8]) {
@@ -934,6 +1029,19 @@ const IRQ_VBLANK: u16 = 1 << 0;
 const IRQ_HBLANK: u16 = 1 << 1;
 const FAST_CTRL_NONE: u32 = 0;
 const FAST_CTRL_HBLANK: u32 = 1;
+const FAST_HBLANK_KIND_OFFSET: usize = 0;
+const FAST_HBLANK_REQUESTED_SEQ_OFFSET: usize = 4;
+const FAST_HBLANK_COMPLETED_SEQ_OFFSET: usize = 12;
+const FAST_HBLANK_VCOUNT_OFFSET: usize = 20;
+const FAST_HBLANK_DIRTY_MASK_OFFSET: usize = 24;
+const FAST_HBLANK_BG_HOFS_OFFSET: usize = 28;
+const FAST_HBLANK_BG_VOFS_OFFSET: usize = 36;
+const FAST_HBLANK_IME_OFFSET: usize = 44;
+const FAST_HBLANK_IF_ACK_OFFSET: usize = 46;
+const FAST_HBLANK_DIRTY_BG_HOFS0: u32 = 1 << 0;
+const FAST_HBLANK_DIRTY_BG_VOFS0: u32 = 1 << 4;
+const FAST_HBLANK_DIRTY_IME: u32 = 1 << 8;
+const FAST_HBLANK_DIRTY_IF_ACK: u32 = 1 << 9;
 const DMA_ENABLE: u16 = 1 << 15;
 const DMA_REPEAT: u16 = 1 << 9;
 const DMA_32BIT: u16 = 1 << 10;
@@ -1028,11 +1136,16 @@ fn duration_micros(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        GAME_PAK_ROM_START, IoRegisterWrite, KvmSharedMemory, MOSAIC, PALETTE_SIZE, VRAM_SIZE,
-        io_register_write,
+        FAST_HBLANK_BG_HOFS_OFFSET, FAST_HBLANK_BG_VOFS_OFFSET, FAST_HBLANK_COMPLETED_SEQ_OFFSET,
+        FAST_HBLANK_DIRTY_BG_HOFS0, FAST_HBLANK_DIRTY_BG_VOFS0, FAST_HBLANK_DIRTY_IF_ACK,
+        FAST_HBLANK_DIRTY_IME, FAST_HBLANK_DIRTY_MASK_OFFSET, FAST_HBLANK_IF_ACK_OFFSET,
+        FAST_HBLANK_IME_OFFSET, GAME_PAK_ROM_START, IoRegisterWrite, KvmSharedMemory, MOSAIC,
+        PALETTE_SIZE, VRAM_SIZE, io_register_write,
     };
     use crate::{
-        gba::memory_map::{DMA3CNT, DMA3DAD, DMA3SAD, EWRAM_SIZE, IWRAM_SIZE, OAM_SIZE},
+        gba::memory_map::{
+            BG1HOFS, BG1VOFS, DMA3CNT, DMA3DAD, DMA3SAD, EWRAM_SIZE, IF, IME, IWRAM_SIZE, OAM_SIZE,
+        },
         kvm::memory::MemoryRegion,
     };
 
@@ -1086,6 +1199,43 @@ mod tests {
         );
         assert_eq!(shared.read_io_u16(DMA3CNT + 2) & 0x8000, 0);
         assert_eq!(shared.read_io_u16(MOSAIC), 0);
+    }
+
+    #[test]
+    fn shared_hblank_completion_updates_mirror_and_raster_state() {
+        let shared = test_shared_memory(&[]);
+        shared.write_io_u16(IF, 0x0002);
+        shared
+            .hblank_latch_vcount
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        shared
+            .hblank_latch_seq
+            .store(3, std::sync::atomic::Ordering::Release);
+        shared.write_fast_hblank_u32(
+            FAST_HBLANK_DIRTY_MASK_OFFSET,
+            (FAST_HBLANK_DIRTY_BG_HOFS0 << 1)
+                | (FAST_HBLANK_DIRTY_BG_VOFS0 << 1)
+                | FAST_HBLANK_DIRTY_IME
+                | FAST_HBLANK_DIRTY_IF_ACK,
+        );
+        shared.write_fast_hblank_u16(FAST_HBLANK_BG_HOFS_OFFSET + 2, 0x0042);
+        shared.write_fast_hblank_u16(FAST_HBLANK_BG_VOFS_OFFSET + 2, 0x0017);
+        shared.write_fast_hblank_u16(FAST_HBLANK_IME_OFFSET, 1);
+        shared.write_fast_hblank_u16(FAST_HBLANK_IF_ACK_OFFSET, 0x0002);
+        shared.write_fast_hblank_u64(FAST_HBLANK_COMPLETED_SEQ_OFFSET, 3);
+
+        assert!(shared.wait_for_hblank_complete(3, std::time::Duration::from_millis(1)));
+
+        assert_eq!(shared.read_io_u16(IF) & 0x0002, 0);
+        assert_eq!(shared.read_io_u16(IME), 1);
+        assert_eq!(shared.read_io_u16(BG1HOFS), 0x0042);
+        assert_eq!(shared.read_io_u16(BG1VOFS), 0x0017);
+        let bg_offset = shared
+            .bg_offset_scanline
+            .lock()
+            .expect("bg offset scanline lock poisoned");
+        assert_eq!(bg_offset.hofs[1][8], 0x0042);
+        assert_eq!(bg_offset.vofs[1][8], 0x0017);
     }
 
     fn test_shared_memory(rom: &[u8]) -> KvmSharedMemory {

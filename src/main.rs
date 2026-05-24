@@ -75,12 +75,14 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
     let shared = machine.shared_memory();
     let stop = Arc::new(AtomicBool::new(false));
     let kvm_stop = Arc::clone(&stop);
+    let kvm_error_stop = Arc::clone(&stop);
     let vcount_stop = Arc::clone(&stop);
     let vcount_memory = Arc::clone(&shared);
 
     std::thread::spawn(move || {
         if let Err(err) = machine.run(kvm_stop) {
             eprintln!("kgba kvm: {err}");
+            kvm_error_stop.store(true, Ordering::Relaxed);
         }
     });
 
