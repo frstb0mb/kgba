@@ -23,8 +23,13 @@ use crate::gba::{
 };
 
 use self::{
-    bootstrap::install_bios_and_cache_bootstrap, fd::Fd, memory::MemorySlot, regs::set_one_reg_u64,
-    run::RunMapping, trace::trace_io_mmio, util::last_os_error,
+    bootstrap::{FAST_EXIT_ADDR, FAST_MEM_SIZE, FAST_MEM_START, install_bios_and_cache_bootstrap},
+    fd::Fd,
+    memory::MemorySlot,
+    regs::set_one_reg_u64,
+    run::RunMapping,
+    trace::{trace_io_mmio, trace_kvm_exit},
+    util::last_os_error,
 };
 
 pub use self::shared_memory::KvmSharedMemory;
@@ -71,6 +76,8 @@ impl KvmGba {
             MemorySlot::anonymous(vm_fd.raw(), &mut slot_id, EWRAM_START, EWRAM_SIZE, 0)?;
         let iwram_slot =
             MemorySlot::anonymous(vm_fd.raw(), &mut slot_id, IWRAM_START, IWRAM_SIZE, 0)?;
+        let fast_slot =
+            MemorySlot::anonymous(vm_fd.raw(), &mut slot_id, FAST_MEM_START, FAST_MEM_SIZE, 0)?;
         let iwram_irq_mirror_slot = MemorySlot::alias(
             vm_fd.raw(),
             &mut slot_id,
@@ -104,7 +111,7 @@ impl KvmGba {
             cartridge.rom(),
         )?);
 
-        install_bios_and_cache_bootstrap(&bios_slot.region, &iwram_slot.region);
+        install_bios_and_cache_bootstrap(&bios_slot.region, &iwram_slot.region, &fast_slot.region);
 
         let shared = Arc::new(KvmSharedMemory::new(
             ewram_slot.region.clone_for_shared(),
@@ -113,6 +120,7 @@ impl KvmGba {
             palette_slot.region.clone_for_shared(),
             vram_slot.region.clone_for_shared(),
             oam_slot.region.clone_for_shared(),
+            fast_slot.region.clone_for_shared(),
             cartridge.rom(),
             vm_fd.raw(),
         ));
@@ -120,6 +128,7 @@ impl KvmGba {
         slots.push(bios_slot);
         slots.push(ewram_slot);
         slots.push(iwram_slot);
+        slots.push(fast_slot);
         slots.push(iwram_irq_mirror_slot);
         slots.push(io_slot);
         slots.push(palette_slot);
@@ -163,7 +172,6 @@ impl KvmGba {
         if ret != 0 {
             return Err(last_os_error("KVM_ARM_VCPU_INIT"));
         }
-
         set_one_reg_u64(vcpu_fd.raw(), sys::reg_arm64_core_pc(), BIOS_START as u64)?;
 
         Ok(Self {
@@ -187,7 +195,6 @@ impl KvmGba {
             if ret != 0 {
                 return Err(last_os_error("KVM_RUN"));
             }
-
             match self.run.exit_reason() {
                 sys::KVM_EXIT_MMIO => self.handle_mmio(),
                 sys::KVM_EXIT_EXCEPTION
@@ -199,7 +206,7 @@ impl KvmGba {
                         self.run.exit_reason()
                     ));
                 }
-                _ => {}
+                reason => trace_kvm_exit(reason),
             }
         }
         Ok(())
@@ -207,7 +214,9 @@ impl KvmGba {
 
     fn handle_mmio(&mut self) {
         let mmio = self.run.mmio();
-        if mmio.phys_addr >= u64::from(IO_START)
+        if mmio.phys_addr == u64::from(FAST_EXIT_ADDR) && mmio.is_write != 0 {
+            self.shared.finish_fast_hblank();
+        } else if mmio.phys_addr >= u64::from(IO_START)
             && mmio.phys_addr < u64::from(IO_START + IO_SIZE as u32)
         {
             let addr = mmio.phys_addr as u32;
@@ -222,7 +231,10 @@ impl KvmGba {
                     .copy_io_read(addr, len, &mut self.run.mmio_mut().data);
                 trace_io_mmio("read", addr, len, &self.run.mmio().data);
             }
-        } else if mmio.is_write == 0 {
+        } else if mmio.is_write != 0 {
+            trace_io_mmio("write", mmio.phys_addr as u32, mmio.len, &mmio.data);
+        } else {
+            trace_io_mmio("read", mmio.phys_addr as u32, mmio.len, &mmio.data);
             self.run.mmio_mut().data = [0; 8];
         }
     }

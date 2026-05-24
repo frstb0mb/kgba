@@ -2,7 +2,7 @@ use std::{
     os::fd::RawFd,
     sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     },
 };
 
@@ -14,16 +14,17 @@ use crate::gba::{
         IO_START, IWRAM_SIZE, IWRAM_START, KEYINPUT, MOSAIC, OAM_SIZE, OAM_START, PALETTE_SIZE,
         PALETTE_START, VCOUNT, VRAM_SIZE, VRAM_START, WIN0H, WIN0V, WIN1H, WIN1V, WININ, WINOUT,
     },
-    ppu::{FrameBuffer, Ppu},
+    ppu::{FrameBuffer, HEIGHT, Ppu},
 };
 
 use super::{
+    bootstrap::{FAST_CTRL_ADDR, FAST_MEM_START, SHADOW_IO_ADDR},
     memory::MemoryRegion,
     sys,
     timers::Timers,
     trace::{
-        trace_input_io_write, trace_input_irq_line, trace_input_keyinput, trace_input_vblank,
-        trace_timer_register_write,
+        trace_fast_hblank, trace_hblank_pending, trace_input_io_write, trace_input_irq_line,
+        trace_input_keyinput, trace_input_vblank, trace_timer_register_write,
     },
     util::last_os_error,
 };
@@ -36,13 +37,38 @@ pub struct KvmSharedMemory {
     pub(super) palette: MemoryRegion,
     pub(super) vram: MemoryRegion,
     pub(super) oam: MemoryRegion,
+    pub(super) fast: MemoryRegion,
     rom: Box<[u8]>,
     pub(super) timers: Mutex<Timers>,
+    bg_offset_scanline: Mutex<BgOffsetRaster>,
+    bghofs_scanline_active: [AtomicBool; 4],
+    bgvofs_scanline_active: [AtomicBool; 4],
+    hblank_latch_vcount: AtomicU16,
+    hblank_pending_count: AtomicU64,
     interrupt_line: InterruptLine,
 }
 
 unsafe impl Send for KvmSharedMemory {}
 unsafe impl Sync for KvmSharedMemory {}
+
+#[derive(Debug)]
+struct BgOffsetRaster {
+    hofs: [[u16; HEIGHT]; 4],
+    completed_hofs: [[u16; HEIGHT]; 4],
+    vofs: [[u16; HEIGHT]; 4],
+    completed_vofs: [[u16; HEIGHT]; 4],
+}
+
+impl Default for BgOffsetRaster {
+    fn default() -> Self {
+        Self {
+            hofs: [[0; HEIGHT]; 4],
+            completed_hofs: [[0; HEIGHT]; 4],
+            vofs: [[0; HEIGHT]; 4],
+            completed_vofs: [[0; HEIGHT]; 4],
+        }
+    }
+}
 
 impl KvmSharedMemory {
     pub fn new(
@@ -52,6 +78,7 @@ impl KvmSharedMemory {
         palette: MemoryRegion,
         vram: MemoryRegion,
         oam: MemoryRegion,
+        fast: MemoryRegion,
         rom: &[u8],
         vm_fd: RawFd,
     ) -> Self {
@@ -62,8 +89,14 @@ impl KvmSharedMemory {
             palette,
             vram,
             oam,
+            fast,
             rom: rom.to_vec().into_boxed_slice(),
             timers: Mutex::new(Timers::new()),
+            bg_offset_scanline: Mutex::new(BgOffsetRaster::default()),
+            bghofs_scanline_active: std::array::from_fn(|_| AtomicBool::new(false)),
+            bgvofs_scanline_active: std::array::from_fn(|_| AtomicBool::new(false)),
+            hblank_latch_vcount: AtomicU16::new(0xffff),
+            hblank_pending_count: AtomicU64::new(0),
             interrupt_line: InterruptLine::new(vm_fd),
         };
         shared.write_io_u16(BG2PA, 0x0100);
@@ -74,11 +107,36 @@ impl KvmSharedMemory {
     pub fn set_vcount(&self, value: u16) {
         let old_dispstat = self.read_io_u16(DISPSTAT);
         self.write_io_u16(VCOUNT, value);
-        let mut dispstat = old_dispstat & !DISPSTAT_VBLANK;
+        let mut dispstat = old_dispstat & !(DISPSTAT_VBLANK | DISPSTAT_HBLANK);
         if value >= 160 {
             dispstat |= DISPSTAT_VBLANK;
         }
         self.write_io_u16(DISPSTAT, dispstat);
+        if value == 160 {
+            let mut bg_offset = self
+                .bg_offset_scanline
+                .lock()
+                .expect("bg offset scanline lock poisoned");
+            bg_offset.completed_hofs = bg_offset.hofs;
+            bg_offset.completed_vofs = bg_offset.vofs;
+        }
+        if usize::from(value) < HEIGHT {
+            let mut bg_offset = self
+                .bg_offset_scanline
+                .lock()
+                .expect("bg offset scanline lock poisoned");
+            let y = usize::from(value);
+            for (bg, register) in [BG0HOFS, BG1HOFS, BG2HOFS, BG3HOFS].into_iter().enumerate() {
+                if !self.bghofs_scanline_active[bg].load(Ordering::Relaxed) {
+                    bg_offset.hofs[bg][y] = self.read_io_u16(register);
+                }
+            }
+            for (bg, register) in [BG0VOFS, BG1VOFS, BG2VOFS, BG3VOFS].into_iter().enumerate() {
+                if !self.bgvofs_scanline_active[bg].load(Ordering::Relaxed) {
+                    bg_offset.vofs[bg][y] = self.read_io_u16(register);
+                }
+            }
+        }
 
         if old_dispstat & DISPSTAT_VBLANK == 0
             && dispstat & DISPSTAT_VBLANK != 0
@@ -91,7 +149,43 @@ impl KvmSharedMemory {
                 self.read_io_u16(IME),
             );
             self.request_interrupt(IRQ_VBLANK);
+            if self.read_io_u16(IE) & IRQ_VBLANK != 0 && self.read_io_u16(IME) & 1 != 0 {
+                self.interrupt_line.pulse();
+            }
         }
+    }
+
+    pub fn enter_hblank(&self) {
+        let old_dispstat = self.read_io_u16(DISPSTAT);
+        let dispstat = old_dispstat | DISPSTAT_HBLANK;
+        self.write_io_u16(DISPSTAT, dispstat);
+        if old_dispstat & DISPSTAT_HBLANK != 0 {
+            return;
+        }
+        let vcount = self.read_io_u16(VCOUNT);
+        if dispstat & DISPSTAT_HBLANK_IRQ_ENABLE == 0
+            || self.read_io_u16(DISPCNT) == 0
+            || !(vcount < 160 || vcount == 227)
+        {
+            return;
+        }
+        if self.read_io_u16(IF) & IRQ_HBLANK != 0 {
+            if self.read_io_u16(IE) & IRQ_HBLANK != 0 && self.read_io_u16(IME) & 1 != 0 {
+                self.hblank_pending_count.fetch_add(1, Ordering::Relaxed);
+                trace_hblank_pending(
+                    vcount,
+                    self.read_io_u16(IE),
+                    self.read_io_u16(IF),
+                    self.read_io_u16(IME),
+                );
+            }
+            return;
+        }
+        self.hblank_pending_count.store(0, Ordering::Relaxed);
+        self.hblank_latch_vcount.store(vcount, Ordering::Relaxed);
+        self.prepare_fast_hblank(vcount);
+        self.request_interrupt(IRQ_HBLANK);
+        self.interrupt_line.pulse();
     }
 
     pub fn tick_scanline(&self) {
@@ -104,6 +198,51 @@ impl KvmSharedMemory {
         if old != value {
             trace_input_keyinput(value);
         }
+    }
+
+    fn prepare_fast_hblank(&self, vcount: u16) {
+        let io_len = self.io.as_slice().len();
+        let shadow_offset = fast_offset(SHADOW_IO_ADDR);
+        self.fast.as_mut_slice()[shadow_offset..shadow_offset + io_len]
+            .copy_from_slice(self.io.as_slice());
+        self.write_shadow_io_u16(VCOUNT, vcount);
+        self.write_shadow_io_u16(IF, self.read_io_u16(IF) | IRQ_HBLANK);
+        self.write_shadow_io_u16(DISPSTAT, self.read_io_u16(DISPSTAT) | DISPSTAT_HBLANK);
+        self.write_fast_u32(FAST_CTRL_ADDR, FAST_CTRL_HBLANK);
+    }
+
+    pub fn finish_fast_hblank(&self) {
+        self.write_fast_u32(FAST_CTRL_ADDR, FAST_CTRL_NONE);
+        let ack = self.read_shadow_io_u16(IF) | IRQ_HBLANK;
+        let bg1hofs = self.read_shadow_io_u16(BG1HOFS);
+        let vcount = self.hblank_latch_vcount.load(Ordering::Relaxed);
+        self.write_io_u16(IF, self.read_io_u16(IF) & !ack);
+        self.write_io_u16(IME, self.read_shadow_io_u16(IME));
+
+        let target_line = self.hblank_target_line();
+        let mut bg_offset = self
+            .bg_offset_scanline
+            .lock()
+            .expect("bg offset scanline lock poisoned");
+        for (index, register) in [BG0HOFS, BG1HOFS, BG2HOFS, BG3HOFS].into_iter().enumerate() {
+            let value = self.read_shadow_io_u16(register);
+            self.write_io_u16(register, value);
+            if let Some(line) = target_line {
+                bg_offset.hofs[index][line] = value;
+                self.bghofs_scanline_active[index].store(true, Ordering::Relaxed);
+            }
+        }
+        for (index, register) in [BG0VOFS, BG1VOFS, BG2VOFS, BG3VOFS].into_iter().enumerate() {
+            let value = self.read_shadow_io_u16(register);
+            self.write_io_u16(register, value);
+            if let Some(line) = target_line {
+                bg_offset.vofs[index][line] = value;
+                self.bgvofs_scanline_active[index].store(true, Ordering::Relaxed);
+            }
+        }
+        drop(bg_offset);
+        trace_fast_hblank(vcount, bg1hofs, ack);
+        self.update_interrupt_line();
     }
 
     pub fn render_frame(&self) -> FrameBuffer {
@@ -121,6 +260,22 @@ impl KvmSharedMemory {
         ppu.write_bgvofs(1, self.read_io_u16(BG1VOFS));
         ppu.write_bgvofs(2, self.read_io_u16(BG2VOFS));
         ppu.write_bgvofs(3, self.read_io_u16(BG3VOFS));
+        let bg_offset = self
+            .bg_offset_scanline
+            .lock()
+            .expect("bg offset scanline lock poisoned");
+        for bg in 0..4 {
+            if self.bghofs_scanline_active[bg].load(Ordering::Relaxed) {
+                for y in 0..HEIGHT {
+                    ppu.write_bghofs_scanline(bg, y, bg_offset.completed_hofs[bg][y]);
+                }
+            }
+            if self.bgvofs_scanline_active[bg].load(Ordering::Relaxed) {
+                for y in 0..HEIGHT {
+                    ppu.write_bgvofs_scanline(bg, y, bg_offset.completed_vofs[bg][y]);
+                }
+            }
+        }
         ppu.write_bgpa(2, self.read_io_u16(BG2PA));
         ppu.write_bgpb(2, self.read_io_u16(BG2PB));
         ppu.write_bgpc(2, self.read_io_u16(BG2PC));
@@ -145,13 +300,67 @@ impl KvmSharedMemory {
     }
 
     pub fn debug_video_state(&self) -> KvmVideoDebugState {
+        let bg_offset = self
+            .bg_offset_scanline
+            .lock()
+            .expect("bg offset scanline lock poisoned");
+        let bg1_min = bg_offset.completed_hofs[1]
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(0);
+        let bg1_max = bg_offset.completed_hofs[1]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let bg1_sample = bg_offset.completed_hofs[1][80];
+        let bg1_checksum = bg_offset.completed_hofs[1]
+            .iter()
+            .fold(0u32, |sum, value| sum.wrapping_add(u32::from(*value)));
+        drop(bg_offset);
         KvmVideoDebugState {
             dispcnt: self.read_io_u16(DISPCNT),
+            bg0cnt: self.read_io_u16(BG0CNT),
+            bg1cnt: self.read_io_u16(BG1CNT),
             bg2cnt: self.read_io_u16(BG2CNT),
+            bg0hofs: self.read_io_u16(BG0HOFS),
+            bg1hofs: self.read_io_u16(BG1HOFS),
+            keyinput: self.read_io_u16(KEYINPUT),
+            irq_waitflags: self.read_iwram_u16(0x7ff8),
             mosaic: self.read_io_u16(MOSAIC),
             dma3cnt: self.read_io_u16(DMA0CNT + 3 * 12 + 2),
             vram0: u16::from_le_bytes([self.vram.as_slice()[0], self.vram.as_slice()[1]]),
+            bg0_map_nonzero: self.count_bg_map_nonzero(29),
+            bg0_text_1: self.read_vram_u16(29 * 0x800 + (1 + 1 * 32) * 2),
+            bg0_text_2: self.read_vram_u16(29 * 0x800 + (1 + 2 * 32) * 2),
+            cycle_digit_10: self.read_vram_u16(29 * 0x800 + (11 + 1 * 32) * 2),
+            cycle_digit_1: self.read_vram_u16(29 * 0x800 + (12 + 1 * 32) * 2),
+            cx_digit_10: self.read_vram_u16(29 * 0x800 + (11 + 2 * 32) * 2),
+            cx_digit_1: self.read_vram_u16(29 * 0x800 + (12 + 2 * 32) * 2),
+            bg1_raster_min: bg1_min,
+            bg1_raster_max: bg1_max,
+            bg1_raster_sample: bg1_sample,
+            bg1_raster_checksum: bg1_checksum,
         }
+    }
+
+    fn read_iwram_u16(&self, offset: usize) -> u16 {
+        let iwram = self.iwram.as_slice();
+        u16::from_le_bytes([iwram[offset], iwram[offset + 1]])
+    }
+
+    fn read_vram_u16(&self, offset: usize) -> u16 {
+        let vram = self.vram.as_slice();
+        u16::from_le_bytes([vram[offset], vram[offset + 1]])
+    }
+
+    fn count_bg_map_nonzero(&self, screen_block: usize) -> usize {
+        let base = screen_block * 0x800;
+        self.vram.as_slice()[base..base + 0x800]
+            .chunks_exact(2)
+            .filter(|entry| u16::from_le_bytes([entry[0], entry[1]]) != 0)
+            .count()
     }
 
     pub(super) fn read_io_u16(&self, addr: u32) -> u16 {
@@ -166,6 +375,25 @@ impl KvmSharedMemory {
         let io = self.io.as_mut_slice();
         io[offset] = bytes[0];
         io[offset + 1] = bytes[1];
+    }
+
+    fn read_shadow_io_u16(&self, addr: u32) -> u16 {
+        let offset = fast_offset(SHADOW_IO_ADDR) + (addr - IO_START) as usize;
+        let fast = self.fast.as_slice();
+        u16::from_le_bytes([fast[offset], fast[offset + 1]])
+    }
+
+    fn write_shadow_io_u16(&self, addr: u32, value: u16) {
+        let offset = fast_offset(SHADOW_IO_ADDR) + (addr - IO_START) as usize;
+        let bytes = value.to_le_bytes();
+        let fast = self.fast.as_mut_slice();
+        fast[offset] = bytes[0];
+        fast[offset + 1] = bytes[1];
+    }
+
+    fn write_fast_u32(&self, addr: u32, value: u32) {
+        let offset = fast_offset(addr);
+        self.fast.as_mut_slice()[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 
     pub(super) fn mirror_io_write(&self, addr: u32, len: u32, data: &[u8; 8]) {
@@ -271,6 +499,15 @@ impl KvmSharedMemory {
         trace_input_irq_line(asserted, enabled, requested, self.read_io_u16(IME));
     }
 
+    fn hblank_target_line(&self) -> Option<usize> {
+        let vcount = self.hblank_latch_vcount.load(Ordering::Relaxed);
+        match vcount {
+            0..=158 => Some(usize::from(vcount + 1)),
+            227 => Some(0),
+            _ => None,
+        }
+    }
+
     fn run_immediate_dma_if_enabled(&self, addr: u32) {
         let Some(channel) = dma_channel_for_cnt_high(addr) else {
             return;
@@ -354,17 +591,39 @@ impl KvmSharedMemory {
 #[derive(Clone, Copy, Debug)]
 pub struct KvmVideoDebugState {
     pub dispcnt: u16,
+    pub bg0cnt: u16,
+    pub bg1cnt: u16,
     pub bg2cnt: u16,
+    pub bg0hofs: u16,
+    pub bg1hofs: u16,
+    pub keyinput: u16,
+    pub irq_waitflags: u16,
     pub mosaic: u16,
     pub dma3cnt: u16,
     pub vram0: u16,
+    pub bg0_map_nonzero: usize,
+    pub bg0_text_1: u16,
+    pub bg0_text_2: u16,
+    pub cycle_digit_10: u16,
+    pub cycle_digit_1: u16,
+    pub cx_digit_10: u16,
+    pub cx_digit_1: u16,
+    pub bg1_raster_min: u16,
+    pub bg1_raster_max: u16,
+    pub bg1_raster_sample: u16,
+    pub bg1_raster_checksum: u32,
 }
 
 const DISPSTAT_VBLANK: u16 = 1 << 0;
+const DISPSTAT_HBLANK: u16 = 1 << 1;
 const DISPSTAT_STATUS_MASK: u16 = 0x0007;
 const DISPSTAT_WRITABLE_MASK: u16 = 0xff38;
 const DISPSTAT_VBLANK_IRQ_ENABLE: u16 = 1 << 3;
+const DISPSTAT_HBLANK_IRQ_ENABLE: u16 = 1 << 4;
 const IRQ_VBLANK: u16 = 1 << 0;
+const IRQ_HBLANK: u16 = 1 << 1;
+const FAST_CTRL_NONE: u32 = 0;
+const FAST_CTRL_HBLANK: u32 = 1;
 const DMA_ENABLE: u16 = 1 << 15;
 const DMA_REPEAT: u16 = 1 << 9;
 const DMA_32BIT: u16 = 1 << 10;
@@ -389,6 +648,16 @@ impl InterruptLine {
             return;
         }
 
+        self.set_level(asserted);
+    }
+
+    fn pulse(&self) {
+        self.asserted.store(true, Ordering::Relaxed);
+        self.set_level(false);
+        self.set_level(true);
+    }
+
+    fn set_level(&self, asserted: bool) {
         let mut level = sys::KvmIrqLevel {
             irq: KVM_ARM_CPU_IRQ,
             level: u32::from(asserted),
@@ -436,6 +705,10 @@ fn io_register_write(
     } else {
         Some(IoRegisterWrite { mask, value })
     }
+}
+
+fn fast_offset(addr: u32) -> usize {
+    (addr - FAST_MEM_START) as usize
 }
 
 #[cfg(test)]
@@ -509,6 +782,7 @@ mod tests {
             MemoryRegion::anonymous(PALETTE_SIZE).expect("palette"),
             MemoryRegion::anonymous(VRAM_SIZE).expect("vram"),
             MemoryRegion::anonymous(OAM_SIZE).expect("oam"),
+            MemoryRegion::anonymous(0x10000).expect("fast"),
             rom,
             -1,
         )

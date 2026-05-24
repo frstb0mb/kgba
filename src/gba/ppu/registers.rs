@@ -1,6 +1,6 @@
 use super::{
     DISPSTAT_HBLANK, DISPSTAT_IRQ_WRITABLE_MASK, DISPSTAT_VBLANK, DISPSTAT_VCOUNT,
-    DISPSTAT_VCOUNT_SETTING_MASK, TOTAL_SCANLINES, VISIBLE_SCANLINES,
+    DISPSTAT_VCOUNT_SETTING_MASK, HEIGHT, TOTAL_SCANLINES, VISIBLE_SCANLINES,
 };
 
 #[derive(Debug)]
@@ -10,7 +10,11 @@ pub struct Ppu {
     pub(super) vcount: u16,
     pub(super) bgcnt: [u16; 4],
     pub(super) bghofs: [u16; 4],
+    pub(super) bghofs_scanline: [[u16; HEIGHT]; 4],
+    pub(super) bghofs_scanline_valid: [bool; 4],
     pub(super) bgvofs: [u16; 4],
+    pub(super) bgvofs_scanline: [[u16; HEIGHT]; 4],
+    pub(super) bgvofs_scanline_valid: [bool; 4],
     pub(super) bgpa: [u16; 2],
     pub(super) bgpb: [u16; 2],
     pub(super) bgpc: [u16; 2],
@@ -35,7 +39,11 @@ impl Default for Ppu {
             vcount: 0,
             bgcnt: [0; 4],
             bghofs: [0; 4],
+            bghofs_scanline: [[0; HEIGHT]; 4],
+            bghofs_scanline_valid: [false; 4],
             bgvofs: [0; 4],
+            bgvofs_scanline: [[0; HEIGHT]; 4],
+            bgvofs_scanline_valid: [false; 4],
             bgpa: [0x0100; 2],
             bgpb: [0; 2],
             bgpc: [0; 2],
@@ -167,8 +175,24 @@ impl Ppu {
         self.bghofs[bg] = value & 0x01ff;
     }
 
+    pub fn write_bghofs_scanline(&mut self, bg: usize, y: usize, value: u16) {
+        if y >= HEIGHT {
+            return;
+        }
+        self.bghofs_scanline[bg][y] = value & 0x01ff;
+        self.bghofs_scanline_valid[bg] = true;
+    }
+
     pub fn write_bgvofs(&mut self, bg: usize, value: u16) {
         self.bgvofs[bg] = value & 0x01ff;
+    }
+
+    pub fn write_bgvofs_scanline(&mut self, bg: usize, y: usize, value: u16) {
+        if y >= HEIGHT {
+            return;
+        }
+        self.bgvofs_scanline[bg][y] = value & 0x01ff;
+        self.bgvofs_scanline_valid[bg] = true;
     }
 
     pub fn write_bgpa(&mut self, bg: usize, value: u16) {

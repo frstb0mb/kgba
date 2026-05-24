@@ -99,6 +99,50 @@ pub fn trace_input_io_write(addr: u32, value: u16, keyinput: u16, vcount: u16) {
     );
 }
 
+pub fn trace_fast_hblank(vcount: u16, hofs: u16, ack: u16) {
+    if trace_enabled("KGBA_TRACE_FASTIRQ") {
+        eprintln!(
+            "kgba fastirq t={} event=hblank_complete vcount={} bg1hofs={hofs:#06x} ack={ack:#06x}",
+            trace_micros(),
+            vcount
+        );
+    }
+}
+
+pub fn trace_kvm_exit(reason: u32) {
+    if !trace_enabled("KGBA_TRACE_KVMEXIT") {
+        return;
+    }
+
+    static EXIT_LOGS: AtomicU64 = AtomicU64::new(0);
+    let log_index = EXIT_LOGS.fetch_add(1, Ordering::Relaxed);
+    if log_index < 64 || log_index.is_multiple_of(4096) {
+        eprintln!(
+            "kgba kvmexit t={} reason={} count={}",
+            trace_micros(),
+            reason,
+            log_index + 1
+        );
+    }
+}
+
+pub fn trace_hblank_pending(vcount: u16, ie: u16, iflag: u16, ime: u16) {
+    if !trace_enabled("KGBA_TRACE_FASTIRQ") {
+        return;
+    }
+
+    static PENDING_LOGS: AtomicU64 = AtomicU64::new(0);
+    let log_index = PENDING_LOGS.fetch_add(1, Ordering::Relaxed);
+    if log_index < 16 || log_index.is_multiple_of(64) {
+        eprintln!(
+            "kgba fastirq t={} event=hblank_pending vcount={} ie={ie:#06x} if={iflag:#06x} ime={ime:#06x} count={}",
+            trace_micros(),
+            vcount,
+            log_index + 1
+        );
+    }
+}
+
 fn is_timer_register_access(addr: u32, len: u32) -> bool {
     let end = addr.saturating_add(len);
     addr < IO_START + 0x0110 && end > IO_START + 0x0100
@@ -116,11 +160,15 @@ fn trace_enabled(name: &'static str) -> bool {
     static TIMER: OnceLock<bool> = OnceLock::new();
     static MMIO: OnceLock<bool> = OnceLock::new();
     static INPUT: OnceLock<bool> = OnceLock::new();
+    static FASTIRQ: OnceLock<bool> = OnceLock::new();
+    static KVMEXIT: OnceLock<bool> = OnceLock::new();
 
     match name {
         "KGBA_TRACE_TIMER" => *TIMER.get_or_init(|| env::var_os(name).is_some()),
         "KGBA_TRACE_MMIO" => *MMIO.get_or_init(|| env::var_os(name).is_some()),
         "KGBA_TRACE_INPUT" => *INPUT.get_or_init(|| env::var_os(name).is_some()),
+        "KGBA_TRACE_FASTIRQ" => *FASTIRQ.get_or_init(|| env::var_os(name).is_some()),
+        "KGBA_TRACE_KVMEXIT" => *KVMEXIT.get_or_init(|| env::var_os(name).is_some()),
         _ => false,
     }
 }

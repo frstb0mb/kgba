@@ -324,8 +324,18 @@ impl Ppu {
         let is_8bpp = bgcnt & (1 << 7) != 0;
         let (bg_width, bg_height) = text_bg_size(bgcnt);
 
-        let bg_x = (screen_x + usize::from(self.bghofs[bg])) % bg_width;
-        let bg_y = (screen_y + usize::from(self.bgvofs[bg])) % bg_height;
+        let hofs = if self.bghofs_scanline_valid[bg] {
+            self.bghofs_scanline[bg][screen_y]
+        } else {
+            self.bghofs[bg]
+        };
+        let vofs = if self.bgvofs_scanline_valid[bg] {
+            self.bgvofs_scanline[bg][screen_y]
+        } else {
+            self.bgvofs[bg]
+        };
+        let bg_x = (screen_x + usize::from(hofs)) % bg_width;
+        let bg_y = (screen_y + usize::from(vofs)) % bg_height;
         let color_index =
             text_bg_color_index(vram, char_base, screen_base, is_8bpp, bg_width, bg_x, bg_y)?;
         if color_index == 0 {

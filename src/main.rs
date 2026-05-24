@@ -88,13 +88,37 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
 
     if headless {
         let duration_ms = duration_ms.unwrap_or(500);
-        std::thread::sleep(Duration::from_millis(duration_ms));
+        run_headless_input_script(&shared, duration_ms);
         let frame = shared.render_frame();
+        let frame_hash = frame_hash(&frame);
         let lit_pixels = frame.iter().filter(|&&pixel| pixel != 0xff000000).count();
         let video = shared.debug_video_state();
         println!(
-            "kgba kvm lit_pixels={} dispcnt={:#06x} bg2cnt={:#06x} mosaic={:#06x} dma3cnt={:#06x} vram0={:#06x}",
-            lit_pixels, video.dispcnt, video.bg2cnt, video.mosaic, video.dma3cnt, video.vram0
+            "kgba kvm lit_pixels={} frame_hash={:#018x} dispcnt={:#06x} bg0cnt={:#06x} bg1cnt={:#06x} bg2cnt={:#06x} bg0hofs={:#06x} bg1hofs={:#06x} keyinput={:#06x} irq_waitflags={:#06x} mosaic={:#06x} dma3cnt={:#06x} vram0={:#06x} bg0_map_nonzero={} bg0_text_1={:#06x} bg0_text_2={:#06x} cycle_digits={}{} cx_digits={}{} bg1_raster_min={:#06x} bg1_raster_max={:#06x} bg1_raster_sample={:#06x} bg1_raster_checksum={}",
+            lit_pixels,
+            frame_hash,
+            video.dispcnt,
+            video.bg0cnt,
+            video.bg1cnt,
+            video.bg2cnt,
+            video.bg0hofs,
+            video.bg1hofs,
+            video.keyinput,
+            video.irq_waitflags,
+            video.mosaic,
+            video.dma3cnt,
+            video.vram0,
+            video.bg0_map_nonzero,
+            video.bg0_text_1,
+            video.bg0_text_2,
+            tile_ascii(video.cycle_digit_10),
+            tile_ascii(video.cycle_digit_1),
+            tile_ascii(video.cx_digit_10),
+            tile_ascii(video.cx_digit_1),
+            video.bg1_raster_min,
+            video.bg1_raster_max,
+            video.bg1_raster_sample,
+            video.bg1_raster_checksum
         );
         stop.store(true, Ordering::Relaxed);
         return Ok(());
@@ -104,12 +128,18 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
     if let Some(duration_ms) = duration_ms {
         let started = Instant::now();
         let mut next_present = Instant::now();
+        let mut present_count = 0u64;
+        let mut last_keyinput = 0xffff;
         while started.elapsed() < Duration::from_millis(duration_ms) {
             let (_, keyinput) = video.poll_events_and_input();
             shared.set_keyinput(keyinput);
+            trace_video_input(keyinput, &mut last_keyinput);
             let now = Instant::now();
             if now >= next_present {
-                video.present(&shared.render_frame())?;
+                let frame = shared.render_frame();
+                trace_video_frame(present_count, &frame);
+                video.present(&frame)?;
+                present_count += 1;
                 next_present += FRAME_INTERVAL;
                 if next_present < now {
                     next_present = now + FRAME_INTERVAL;
@@ -121,9 +151,19 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
         return Ok(());
     }
 
+    let mut present_count = 0u64;
+    let mut last_keyinput = 0xffff;
     let result = video.run_frame_loop(
-        |_| shared.render_frame(),
-        |keyinput| shared.set_keyinput(keyinput),
+        |_| {
+            let frame = shared.render_frame();
+            trace_video_frame(present_count, &frame);
+            present_count += 1;
+            frame
+        },
+        |keyinput| {
+            shared.set_keyinput(keyinput);
+            trace_video_input(keyinput, &mut last_keyinput);
+        },
     );
     stop.store(true, Ordering::Relaxed);
     result
@@ -131,33 +171,109 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
 
 fn run_vcount_clock(shared: Arc<kgba::kvm::KvmSharedMemory>, stop: Arc<AtomicBool>) {
     let scanline = Duration::from_nanos(73_433);
+    let hdraw = Duration::from_nanos(57_213);
     let mut vcount = 0u16;
     let mut next_tick = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         shared.set_vcount(vcount);
         shared.tick_scanline();
+        wait_until(next_tick + hdraw, &stop);
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        shared.enter_hblank();
         vcount += 1;
         if vcount >= TOTAL_SCANLINES {
             vcount = 0;
         }
         next_tick += scanline;
-        loop {
-            let now = Instant::now();
-            if now >= next_tick {
-                break;
-            }
-            let remaining = next_tick.duration_since(now);
-            if remaining > Duration::from_micros(500) {
-                std::thread::sleep(remaining - Duration::from_micros(200));
-            } else {
-                std::hint::spin_loop();
-            }
+        wait_until(next_tick, &stop);
+    }
+}
+
+fn wait_until(deadline: Instant, stop: &AtomicBool) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.duration_since(now);
+        if remaining > Duration::from_micros(500) {
+            std::thread::sleep(remaining - Duration::from_micros(200));
+        } else {
+            std::hint::spin_loop();
         }
     }
 }
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_742);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const KEYINPUT_RELEASED: u16 = 0x03ff;
+const KEY_RIGHT: u16 = 1 << 4;
+const KEY_LEFT: u16 = 1 << 5;
+const KEY_UP: u16 = 1 << 6;
+const KEY_DOWN: u16 = 1 << 7;
+
+fn run_headless_input_script(shared: &Arc<kgba::kvm::KvmSharedMemory>, duration_ms: u64) {
+    let Some(keyinput) = env::var("KGBA_HEADLESS_KEY")
+        .ok()
+        .and_then(|key| keyinput_for_name(&key))
+    else {
+        std::thread::sleep(Duration::from_millis(duration_ms));
+        return;
+    };
+
+    let press_at = Duration::from_millis((duration_ms / 4).max(1));
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(duration_ms) {
+        if started.elapsed() >= press_at {
+            shared.set_keyinput(keyinput);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    shared.set_keyinput(KEYINPUT_RELEASED);
+}
+
+fn keyinput_for_name(name: &str) -> Option<u16> {
+    let bit = match name {
+        "right" | "d" => KEY_RIGHT,
+        "left" | "a" => KEY_LEFT,
+        "up" | "w" => KEY_UP,
+        "down" | "s" => KEY_DOWN,
+        _ => return None,
+    };
+    Some(KEYINPUT_RELEASED & !bit)
+}
+
+fn tile_ascii(tile: u16) -> char {
+    char::from_u32(u32::from(tile & 0x00ff) + u32::from(b' ')).unwrap_or('?')
+}
+
+fn frame_hash(frame: &[u32]) -> u64 {
+    frame.iter().fold(0xcbf2_9ce4_8422_2325, |hash, pixel| {
+        (hash ^ u64::from(*pixel)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+fn trace_video_frame(count: u64, frame: &[u32]) {
+    if env::var_os("KGBA_TRACE_VIDEO").is_some() && count.is_multiple_of(30) {
+        eprintln!(
+            "kgba video event=present count={} frame_hash={:#018x}",
+            count,
+            frame_hash(frame)
+        );
+    }
+}
+
+fn trace_video_input(keyinput: u16, last_keyinput: &mut u16) {
+    if env::var_os("KGBA_TRACE_VIDEO").is_some() && keyinput != *last_keyinput {
+        eprintln!("kgba video event=input keyinput={keyinput:#06x}");
+        *last_keyinput = keyinput;
+    }
+}
 
 fn run_software(
     rom_path: &str,
