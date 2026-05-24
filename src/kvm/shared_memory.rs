@@ -389,6 +389,7 @@ impl KvmSharedMemory {
     pub fn wait_for_hblank_complete(&self, seq: u64, timeout: Duration) -> bool {
         let started = Instant::now();
         let deadline = Instant::now() + timeout;
+        let spin_deadline = started + HBLANK_COMPLETION_SPIN_BUDGET;
         loop {
             let completed_seq = self.hblank_sync.completed_seq.load(Ordering::Acquire);
             if completed_seq >= seq {
@@ -419,7 +420,11 @@ impl KvmSharedMemory {
                 );
                 return false;
             }
-            std::thread::sleep(Duration::from_micros(5));
+            if Instant::now() < spin_deadline {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
         }
     }
 
@@ -435,13 +440,9 @@ impl KvmSharedMemory {
         }
 
         if is_write {
-            self.perf
-                .kvm_mmio_io_writes
-                .fetch_add(1, Ordering::Relaxed);
+            self.perf.kvm_mmio_io_writes.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.perf
-                .kvm_mmio_io_reads
-                .fetch_add(1, Ordering::Relaxed);
+            self.perf.kvm_mmio_io_reads.fetch_add(1, Ordering::Relaxed);
         }
 
         match addr {
@@ -462,9 +463,7 @@ impl KvmSharedMemory {
                     .fetch_add(1, Ordering::Relaxed);
             }
             _ => {
-                self.perf
-                    .kvm_mmio_io_other
-                    .fetch_add(1, Ordering::Relaxed);
+                self.perf.kvm_mmio_io_other.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -488,10 +487,7 @@ impl KvmSharedMemory {
                 .perf
                 .fast_hblank_shared_count
                 .swap(0, Ordering::Relaxed),
-            fast_hblank_mmio_count: self
-                .perf
-                .fast_hblank_mmio_count
-                .swap(0, Ordering::Relaxed),
+            fast_hblank_mmio_count: self.perf.fast_hblank_mmio_count.swap(0, Ordering::Relaxed),
             kvm_mmio_exits: self.perf.kvm_mmio_exits.swap(0, Ordering::Relaxed),
             kvm_mmio_fast_exit: self.perf.kvm_mmio_fast_exit.swap(0, Ordering::Relaxed),
             kvm_mmio_io_reads: self.perf.kvm_mmio_io_reads.swap(0, Ordering::Relaxed),
@@ -1126,6 +1122,7 @@ const FAST_HBLANK_DIRTY_BG_HOFS0: u32 = 1 << 0;
 const FAST_HBLANK_DIRTY_BG_VOFS0: u32 = 1 << 4;
 const FAST_HBLANK_DIRTY_IME: u32 = 1 << 8;
 const FAST_HBLANK_DIRTY_IF_ACK: u32 = 1 << 9;
+const HBLANK_COMPLETION_SPIN_BUDGET: Duration = Duration::from_micros(80);
 const DMA_ENABLE: u16 = 1 << 15;
 const DMA_REPEAT: u16 = 1 << 9;
 const DMA_32BIT: u16 = 1 << 10;

@@ -20,6 +20,8 @@ const HBLANK_IO_L2_OFFSET: usize = 0x8000;
 const SECTION_SIZE: u32 = 0x0010_0000;
 const TTBR0_INNER_SHAREABLE_WBWA: u32 = (1 << 6) | (1 << 3) | (1 << 1);
 const TTBR0_VALUE: u32 = NORMAL_L1_ADDR | TTBR0_INNER_SHAREABLE_WBWA;
+#[cfg(test)]
+const HBLANK_TTBR0_VALUE: u32 = HBLANK_L1_ADDR | TTBR0_INNER_SHAREABLE_WBWA;
 const KVM_RESET_VECTOR_OFFSET: usize = 0;
 const KVM_RESET_HANDLER_OFFSET: usize = 0x400;
 
@@ -126,4 +128,47 @@ pub fn install_bios_and_cache_bootstrap(
         .copy_from_slice(&SHADOW_IO_SMALL_PAGE.to_le_bytes());
 
     clean_dcache_area(fast_memory.ptr, FAST_MEM_SIZE);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hblank_ttbr0_matches_bios_constant() {
+        assert_eq!(HBLANK_TTBR0_VALUE, 0x0f00_404a);
+    }
+
+    #[test]
+    fn hblank_page_table_maps_io_page_to_shadow_io() {
+        let bios = MemoryRegion::anonymous(kgba_bios::BIOS_SIZE).expect("bios");
+        let iwram = MemoryRegion::anonymous(0x8000).expect("iwram");
+        let fast = MemoryRegion::anonymous(FAST_MEM_SIZE).expect("fast");
+
+        install_bios_and_cache_bootstrap(&bios, &iwram, &fast);
+
+        let fast = fast.as_slice();
+        let io_l1_offset = HBLANK_L1_OFFSET + ((IO_START / SECTION_SIZE) as usize) * 4;
+        let io_l1 = u32::from_le_bytes([
+            fast[io_l1_offset],
+            fast[io_l1_offset + 1],
+            fast[io_l1_offset + 2],
+            fast[io_l1_offset + 3],
+        ]);
+        assert_eq!(io_l1, HBLANK_IO_L2_DESCRIPTOR);
+
+        let io_page = u32::from_le_bytes([
+            fast[HBLANK_IO_L2_OFFSET],
+            fast[HBLANK_IO_L2_OFFSET + 1],
+            fast[HBLANK_IO_L2_OFFSET + 2],
+            fast[HBLANK_IO_L2_OFFSET + 3],
+        ]);
+        assert_eq!(io_page, SHADOW_IO_SMALL_PAGE);
+        assert_eq!(io_page & 0xffff_f000, SHADOW_IO_ADDR);
+
+        let if_offset = 0x0202u32;
+        let ime_offset = 0x0208u32;
+        assert_eq!(if_offset >> 12, 0);
+        assert_eq!(ime_offset >> 12, 0);
+    }
 }

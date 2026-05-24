@@ -14,6 +14,17 @@
 .equ REG_BG3HOFS, 0x0400001c
 .equ REG_BG3VOFS, 0x0400001e
 .equ FAST_HBLANK_STATE, 0x0f00a000
+.equ SHADOW_IO, 0x0f009000
+.equ SHADOW_IF, SHADOW_IO + 0x0202
+.equ SHADOW_IME, SHADOW_IO + 0x0208
+.equ SHADOW_BG0HOFS, SHADOW_IO + 0x0010
+.equ SHADOW_BG0VOFS, SHADOW_IO + 0x0012
+.equ SHADOW_BG1HOFS, SHADOW_IO + 0x0014
+.equ SHADOW_BG1VOFS, SHADOW_IO + 0x0016
+.equ SHADOW_BG2HOFS, SHADOW_IO + 0x0018
+.equ SHADOW_BG2VOFS, SHADOW_IO + 0x001a
+.equ SHADOW_BG3HOFS, SHADOW_IO + 0x001c
+.equ SHADOW_BG3VOFS, SHADOW_IO + 0x001e
 .equ NORMAL_CONTEXTIDR, 0x00000001
 .equ HBLANK_CONTEXTIDR, 0x00000002
 .equ HBLANK_TTBR0, 0x0f00404a
@@ -118,6 +129,8 @@ irq_handler:
     stmdb sp!, {r0-r3,r12,lr}
     ldr r0, reg_if_ptr
     ldrh r1, [r0]
+    cmp r1, #0
+    beq irq_handler_return
     tst r1, #1
     bne irq_handler_slow
     tst r1, #2
@@ -153,34 +166,34 @@ irq_handler_fast_hblank:
     str r2, [r12]
     ldr r2, hblank_dirty_mask
     str r2, [r12, #24]
-    ldr r0, reg_bg0hofs_ptr
+    ldr r0, shadow_bg0hofs_ptr
     ldrh r1, [r0]
     strh r1, [r12, #28]
-    ldr r0, reg_bg1hofs_ptr
+    ldr r0, shadow_bg1hofs_ptr
     ldrh r1, [r0]
     strh r1, [r12, #30]
-    ldr r0, reg_bg2hofs_ptr
+    ldr r0, shadow_bg2hofs_ptr
     ldrh r1, [r0]
     strh r1, [r12, #32]
-    ldr r0, reg_bg3hofs_ptr
+    ldr r0, shadow_bg3hofs_ptr
     ldrh r1, [r0]
     strh r1, [r12, #34]
-    ldr r0, reg_bg0vofs_ptr
+    ldr r0, shadow_bg0vofs_ptr
     ldrh r1, [r0]
     strh r1, [r12, #36]
-    ldr r0, reg_bg1vofs_ptr
+    ldr r0, shadow_bg1vofs_ptr
     ldrh r1, [r0]
     strh r1, [r12, #38]
-    ldr r0, reg_bg2vofs_ptr
+    ldr r0, shadow_bg2vofs_ptr
     ldrh r1, [r0]
     strh r1, [r12, #40]
-    ldr r0, reg_bg3vofs_ptr
+    ldr r0, shadow_bg3vofs_ptr
     ldrh r1, [r0]
     strh r1, [r12, #42]
-    ldr r0, reg_ime_ptr
+    ldr r0, shadow_ime_ptr
     ldrh r1, [r0]
     strh r1, [r12, #44]
-    ldr r0, reg_if_ptr
+    ldr r0, shadow_if_ptr
     ldrh r1, [r0]
     orr r1, r1, #2
     strh r1, [r12, #46]
@@ -205,24 +218,26 @@ reg_interrupt_vector_ptr:
     .word REG_INTERRUPT_VECTOR
 reg_if_ptr:
     .word REG_IF
-reg_ime_ptr:
-    .word REG_IME
-reg_bg0hofs_ptr:
-    .word REG_BG0HOFS
-reg_bg0vofs_ptr:
-    .word REG_BG0VOFS
-reg_bg1hofs_ptr:
-    .word REG_BG1HOFS
-reg_bg1vofs_ptr:
-    .word REG_BG1VOFS
-reg_bg2hofs_ptr:
-    .word REG_BG2HOFS
-reg_bg2vofs_ptr:
-    .word REG_BG2VOFS
-reg_bg3hofs_ptr:
-    .word REG_BG3HOFS
-reg_bg3vofs_ptr:
-    .word REG_BG3VOFS
+shadow_if_ptr:
+    .word SHADOW_IF
+shadow_ime_ptr:
+    .word SHADOW_IME
+shadow_bg0hofs_ptr:
+    .word SHADOW_BG0HOFS
+shadow_bg0vofs_ptr:
+    .word SHADOW_BG0VOFS
+shadow_bg1hofs_ptr:
+    .word SHADOW_BG1HOFS
+shadow_bg1vofs_ptr:
+    .word SHADOW_BG1VOFS
+shadow_bg2hofs_ptr:
+    .word SHADOW_BG2HOFS
+shadow_bg2vofs_ptr:
+    .word SHADOW_BG2VOFS
+shadow_bg3hofs_ptr:
+    .word SHADOW_BG3HOFS
+shadow_bg3vofs_ptr:
+    .word SHADOW_BG3VOFS
 fast_hblank_state_ptr:
     .word FAST_HBLANK_STATE
 hblank_dirty_mask:
