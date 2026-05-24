@@ -78,7 +78,7 @@ impl<'a> Bus<'a> {
         }
     }
 
-    pub fn render_frame_argb8888(&self) -> FrameBuffer {
+    pub fn render_frame_bgr555(&self) -> FrameBuffer {
         self.ppu
             .render_frame(self.memory.palette(), self.memory.vram(), self.memory.oam())
     }

@@ -4,7 +4,7 @@ use super::{
     WIN1_ENABLE,
 };
 
-pub type FrameBuffer = Vec<u32>;
+pub type FrameBuffer = Vec<u16>;
 
 const BG_ENABLE: [u16; 4] = [BG0_ENABLE, BG1_ENABLE, BG2_ENABLE, BG3_ENABLE];
 const WIN_LAYER_BG0: u16 = 1 << 0;
@@ -38,7 +38,7 @@ impl Ppu {
             MODE_3 => self.render_mode3(vram),
             MODE_4 => self.render_mode4(palette, vram),
             MODE_5 => self.render_mode5(vram),
-            _ => vec![0xff000000; WIDTH * HEIGHT],
+            _ => vec![0; WIDTH * HEIGHT],
         };
 
         if self.dispcnt & OBJ_ENABLE != 0 {
@@ -50,7 +50,7 @@ impl Ppu {
 
     pub fn render_mode0(&self, palette: &[u8], vram: &[u8]) -> FrameBuffer {
         let backdrop = read_u16_checked(palette, 0).unwrap_or(0);
-        let mut frame = vec![bgr555_to_argb8888(backdrop); WIDTH * HEIGHT];
+        let mut frame = vec![backdrop; WIDTH * HEIGHT];
 
         if (self.dispcnt & DISPCNT_MODE_MASK) != MODE_0 {
             return frame;
@@ -89,15 +89,41 @@ impl Ppu {
                 } else {
                     layers[0].color
                 };
-                frame[y * WIDTH + x] = bgr555_to_argb8888(color);
+                frame[y * WIDTH + x] = color;
             }
         }
 
         frame
     }
 
+    pub fn render_mode0_scanline(&self, y: usize, palette: &[u8], vram: &[u8], line: &mut [u16]) {
+        if y >= HEIGHT || line.len() < WIDTH {
+            return;
+        }
+
+        let backdrop = read_u16_checked(palette, 0).unwrap_or(0);
+        line[..WIDTH].fill(backdrop);
+
+        if (self.dispcnt & DISPCNT_MODE_MASK) != MODE_0 {
+            return;
+        }
+
+        let bg_order = self.sorted_bg_order();
+        for (x, pixel) in line.iter_mut().take(WIDTH).enumerate() {
+            for bg in bg_order {
+                if self.dispcnt & BG_ENABLE[bg] == 0 {
+                    continue;
+                }
+                if let Some(color) = self.text_bg_pixel_raw(bg, x, y, palette, vram) {
+                    *pixel = color;
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn render_mode3(&self, vram: &[u8]) -> FrameBuffer {
-        let mut frame = vec![0xff000000; WIDTH * HEIGHT];
+        let mut frame = vec![0; WIDTH * HEIGHT];
 
         if (self.dispcnt & DISPCNT_MODE_MASK) != MODE_3 || (self.dispcnt & BG2_ENABLE) == 0 {
             return frame;
@@ -111,7 +137,7 @@ impl Ppu {
                 };
                 let offset = (source_y * WIDTH + source_x) * 2;
                 let color = u16::from_le_bytes([vram[offset], vram[offset + 1]]);
-                frame[y * WIDTH + x] = bgr555_to_argb8888(color);
+                frame[y * WIDTH + x] = color;
             }
         }
 
@@ -119,7 +145,7 @@ impl Ppu {
     }
 
     pub fn render_mode4(&self, palette: &[u8], vram: &[u8]) -> FrameBuffer {
-        let mut frame = vec![0xff000000; WIDTH * HEIGHT];
+        let mut frame = vec![0; WIDTH * HEIGHT];
 
         if (self.dispcnt & DISPCNT_MODE_MASK) != MODE_4 || (self.dispcnt & BG2_ENABLE) == 0 {
             return frame;
@@ -141,7 +167,7 @@ impl Ppu {
                 let palette_offset = color_index * 2;
                 let color =
                     u16::from_le_bytes([palette[palette_offset], palette[palette_offset + 1]]);
-                frame[y * WIDTH + x] = bgr555_to_argb8888(color);
+                frame[y * WIDTH + x] = color;
             }
         }
 
@@ -149,7 +175,7 @@ impl Ppu {
     }
 
     pub fn render_mode5(&self, vram: &[u8]) -> FrameBuffer {
-        let mut frame = vec![0xff000000; WIDTH * HEIGHT];
+        let mut frame = vec![0; WIDTH * HEIGHT];
 
         if (self.dispcnt & DISPCNT_MODE_MASK) != MODE_5 || (self.dispcnt & BG2_ENABLE) == 0 {
             return frame;
@@ -170,14 +196,14 @@ impl Ppu {
                 };
                 let offset = page_offset + (source_y * MODE5_WIDTH + source_x) * 2;
                 let color = u16::from_le_bytes([vram[offset], vram[offset + 1]]);
-                frame[y * WIDTH + x] = bgr555_to_argb8888(color);
+                frame[y * WIDTH + x] = color;
             }
         }
 
         frame
     }
 
-    fn render_objs(&self, palette: &[u8], vram: &[u8], oam: &[u8], frame: &mut [u32]) {
+    fn render_objs(&self, palette: &[u8], vram: &[u8], oam: &[u8], frame: &mut [u16]) {
         let mut objs = Vec::with_capacity(128);
         for obj_index in 0..128 {
             let offset = obj_index * 8;
@@ -271,8 +297,7 @@ impl Ppu {
                         OBJ_PALETTE_BASE + (palette_bank * 16 + usize::from(color_index)) * 2;
                     let color =
                         u16::from_le_bytes([palette[palette_index], palette[palette_index + 1]]);
-                    frame[screen_y as usize * WIDTH + screen_x as usize] =
-                        bgr555_to_argb8888(color);
+                    frame[screen_y as usize * WIDTH + screen_x as usize] = color;
                 }
             }
         }

@@ -143,6 +143,27 @@ pub fn trace_hblank_pending(vcount: u16, ie: u16, iflag: u16, ime: u16) {
     }
 }
 
+pub fn trace_hblank_wait_timeout(
+    seq: u64,
+    completed_seq: u64,
+    vcount: u16,
+    ie: u16,
+    iflag: u16,
+    ime: u16,
+) {
+    if !trace_enabled("KGBA_TRACE_FASTIRQ") {
+        return;
+    }
+
+    eprintln!(
+        "kgba fastirq t={} event=hblank_wait_timeout seq={} completed_seq={} vcount={} ie={ie:#06x} if={iflag:#06x} ime={ime:#06x}",
+        trace_micros(),
+        seq,
+        completed_seq,
+        vcount
+    );
+}
+
 fn is_timer_register_access(addr: u32, len: u32) -> bool {
     let end = addr.saturating_add(len);
     addr < IO_START + 0x0110 && end > IO_START + 0x0100

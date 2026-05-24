@@ -11,7 +11,7 @@ const SDL_WINDOW_SHOWN: u32 = 0x0000_0004;
 const SDL_RENDERER_SOFTWARE: u32 = 0x0000_0001;
 const SDL_RENDERER_ACCELERATED: u32 = 0x0000_0002;
 const SDL_TEXTUREACCESS_STREAMING: c_int = 1;
-const SDL_PIXELFORMAT_ARGB8888: u32 = 372645892;
+const SDL_PIXELFORMAT_BGR555: u32 = 357_764_866;
 const SDL_QUIT: u32 = 0x100;
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_742);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -135,7 +135,7 @@ impl Video {
 
             let texture = SDL_CreateTexture(
                 renderer,
-                SDL_PIXELFORMAT_ARGB8888,
+                SDL_PIXELFORMAT_BGR555,
                 SDL_TEXTUREACCESS_STREAMING,
                 WIDTH as c_int,
                 HEIGHT as c_int,
@@ -154,13 +154,13 @@ impl Video {
         }
     }
 
-    pub fn present(&mut self, frame: &[u32]) -> Result<(), String> {
+    pub fn present(&mut self, frame: &[u16]) -> Result<(), String> {
         unsafe {
             if SDL_UpdateTexture(
                 self.texture,
                 ptr::null(),
                 frame.as_ptr().cast(),
-                (WIDTH * 4) as c_int,
+                (WIDTH * 2) as c_int,
             ) != 0
             {
                 return Err(sdl_error());
@@ -172,7 +172,7 @@ impl Video {
         Ok(())
     }
 
-    pub fn run_until_quit(&mut self, frame: &[u32], minimum: Duration) -> Result<(), String> {
+    pub fn run_until_quit(&mut self, frame: &[u16], minimum: Duration) -> Result<(), String> {
         let started = Instant::now();
         loop {
             self.present(frame)?;
@@ -185,11 +185,11 @@ impl Video {
 
     pub fn run_frame_loop<F, I>(
         &mut self,
-        mut next_frame: F,
+        mut present_frame: F,
         mut publish_input: I,
     ) -> Result<(), String>
     where
-        F: FnMut(u16) -> Vec<u32>,
+        F: FnMut(&mut Self, u16) -> Result<(), String>,
         I: FnMut(u16),
     {
         let mut vcount = 0u16;
@@ -203,8 +203,7 @@ impl Video {
 
             let now = Instant::now();
             if now >= next_present {
-                let frame = next_frame(vcount);
-                self.present(&frame)?;
+                present_frame(self, vcount)?;
                 vcount = if vcount + 1 >= 228 { 0 } else { vcount + 1 };
                 next_present += FRAME_INTERVAL;
                 if next_present < now {

@@ -89,9 +89,12 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
     if headless {
         let duration_ms = duration_ms.unwrap_or(500);
         run_headless_input_script(&shared, duration_ms);
-        let frame = shared.render_frame();
-        let frame_hash = frame_hash(&frame);
-        let lit_pixels = frame.iter().filter(|&&pixel| pixel != 0xff000000).count();
+        let (frame_hash, lit_pixels) = shared.with_completed_frame(|_, frame| {
+            (
+                frame_hash(frame),
+                frame.iter().filter(|&&pixel| pixel != 0).count(),
+            )
+        });
         let video = shared.debug_video_state();
         println!(
             "kgba kvm lit_pixels={} frame_hash={:#018x} dispcnt={:#06x} bg0cnt={:#06x} bg1cnt={:#06x} bg2cnt={:#06x} bg0hofs={:#06x} bg1hofs={:#06x} keyinput={:#06x} irq_waitflags={:#06x} mosaic={:#06x} dma3cnt={:#06x} vram0={:#06x} bg0_map_nonzero={} bg0_text_1={:#06x} bg0_text_2={:#06x} cycle_digits={}{} cx_digits={}{} bg1_raster_min={:#06x} bg1_raster_max={:#06x} bg1_raster_sample={:#06x} bg1_raster_checksum={}",
@@ -136,9 +139,10 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
             trace_video_input(keyinput, &mut last_keyinput);
             let now = Instant::now();
             if now >= next_present {
-                let frame = shared.render_frame();
-                trace_video_frame(present_count, &frame);
-                video.present(&frame)?;
+                shared.with_completed_frame(|seq, frame| {
+                    trace_video_frame(present_count, seq, frame);
+                    video.present(frame)
+                })?;
                 present_count += 1;
                 next_present += FRAME_INTERVAL;
                 if next_present < now {
@@ -154,11 +158,13 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
     let mut present_count = 0u64;
     let mut last_keyinput = 0xffff;
     let result = video.run_frame_loop(
-        |_| {
-            let frame = shared.render_frame();
-            trace_video_frame(present_count, &frame);
+        |video, _| {
+            shared.with_completed_frame(|seq, frame| {
+                trace_video_frame(present_count, seq, frame);
+                video.present(frame)
+            })?;
             present_count += 1;
-            frame
+            Ok(())
         },
         |keyinput| {
             shared.set_keyinput(keyinput);
@@ -177,17 +183,37 @@ fn run_vcount_clock(shared: Arc<kgba::kvm::KvmSharedMemory>, stop: Arc<AtomicBoo
     while !stop.load(Ordering::Relaxed) {
         shared.set_vcount(vcount);
         shared.tick_scanline();
+        if vcount < 160 {
+            shared.render_scanline(usize::from(vcount));
+        }
         wait_until(next_tick + hdraw, &stop);
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        shared.enter_hblank();
+        if !shared.hblank_irq_pending() {
+            if let Some(seq) = shared.enter_hblank() {
+                wait_for_hblank_complete(&shared, seq, &stop);
+            }
+        }
         vcount += 1;
+        if vcount == 160 {
+            shared.publish_completed_frame();
+        }
         if vcount >= TOTAL_SCANLINES {
             vcount = 0;
         }
         next_tick += scanline;
+        let now = Instant::now();
+        if next_tick < now {
+            next_tick = now;
+        }
         wait_until(next_tick, &stop);
+    }
+}
+
+fn wait_for_hblank_complete(shared: &kgba::kvm::KvmSharedMemory, seq: u64, stop: &AtomicBool) {
+    if !stop.load(Ordering::Relaxed) {
+        shared.wait_for_hblank_complete(seq, HBLANK_COMPLETION_TIMEOUT);
     }
 }
 
@@ -211,6 +237,7 @@ fn wait_until(deadline: Instant, stop: &AtomicBool) {
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_742);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const HBLANK_COMPLETION_TIMEOUT: Duration = Duration::from_millis(1);
 const KEYINPUT_RELEASED: u16 = 0x03ff;
 const KEY_RIGHT: u16 = 1 << 4;
 const KEY_LEFT: u16 = 1 << 5;
@@ -252,17 +279,18 @@ fn tile_ascii(tile: u16) -> char {
     char::from_u32(u32::from(tile & 0x00ff) + u32::from(b' ')).unwrap_or('?')
 }
 
-fn frame_hash(frame: &[u32]) -> u64 {
+fn frame_hash(frame: &[u16]) -> u64 {
     frame.iter().fold(0xcbf2_9ce4_8422_2325, |hash, pixel| {
         (hash ^ u64::from(*pixel)).wrapping_mul(0x0000_0100_0000_01b3)
     })
 }
 
-fn trace_video_frame(count: u64, frame: &[u32]) {
+fn trace_video_frame(count: u64, seq: u64, frame: &[u16]) {
     if env::var_os("KGBA_TRACE_VIDEO").is_some() && count.is_multiple_of(30) {
         eprintln!(
-            "kgba video event=present count={} frame_hash={:#018x}",
+            "kgba video event=present count={} completed_seq={} frame_hash={:#018x}",
             count,
+            seq,
             frame_hash(frame)
         );
     }
@@ -290,9 +318,9 @@ fn run_software(
         return Err(format!("ROM did not produce a frame: {result:?}"));
     }
 
-    let frame = bus.render_frame_argb8888();
+    let frame = bus.render_frame_bgr555();
     if headless {
-        let lit_pixels = frame.iter().filter(|&&pixel| pixel != 0xff000000).count();
+        let lit_pixels = frame.iter().filter(|&&pixel| pixel != 0).count();
         println!(
             "kgba loaded={} dispcnt={:#06x} lit_pixels={}",
             rom_path,

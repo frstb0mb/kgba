@@ -4,6 +4,7 @@ use std::{
         Mutex,
         atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use crate::gba::{
@@ -14,7 +15,10 @@ use crate::gba::{
         IO_START, IWRAM_SIZE, IWRAM_START, KEYINPUT, MOSAIC, OAM_SIZE, OAM_START, PALETTE_SIZE,
         PALETTE_START, VCOUNT, VRAM_SIZE, VRAM_START, WIN0H, WIN0V, WIN1H, WIN1V, WININ, WINOUT,
     },
-    ppu::{FrameBuffer, HEIGHT, Ppu},
+    ppu::{
+        BG0_ENABLE, BG1_ENABLE, BG2_ENABLE, BG3_ENABLE, DISPCNT_MODE_MASK, FrameBuffer, HEIGHT,
+        MODE_0, OBJ_ENABLE, OBJ_WIN_ENABLE, Ppu, WIDTH, WIN0_ENABLE, WIN1_ENABLE,
+    },
 };
 
 use super::{
@@ -23,8 +27,8 @@ use super::{
     sys,
     timers::Timers,
     trace::{
-        trace_fast_hblank, trace_hblank_pending, trace_input_io_write, trace_input_irq_line,
-        trace_input_keyinput, trace_input_vblank, trace_timer_register_write,
+        trace_fast_hblank, trace_hblank_pending, trace_hblank_wait_timeout, trace_input_io_write,
+        trace_input_irq_line, trace_input_keyinput, trace_input_vblank, trace_timer_register_write,
     },
     util::last_os_error,
 };
@@ -43,7 +47,11 @@ pub struct KvmSharedMemory {
     bg_offset_scanline: Mutex<BgOffsetRaster>,
     bghofs_scanline_active: [AtomicBool; 4],
     bgvofs_scanline_active: [AtomicBool; 4],
+    frame_buffers: Mutex<FrameBuffers>,
+    completed_frame_seq: AtomicU64,
+    hblank_sync: HblankSync,
     hblank_latch_vcount: AtomicU16,
+    hblank_latch_seq: AtomicU64,
     hblank_pending_count: AtomicU64,
     interrupt_line: InterruptLine,
 }
@@ -57,6 +65,31 @@ struct BgOffsetRaster {
     completed_hofs: [[u16; HEIGHT]; 4],
     vofs: [[u16; HEIGHT]; 4],
     completed_vofs: [[u16; HEIGHT]; 4],
+}
+
+#[derive(Debug)]
+struct FrameBuffers {
+    buffers: [FrameBuffer; 2],
+    work_index: usize,
+    completed_index: usize,
+    seq: u64,
+}
+
+#[derive(Debug, Default)]
+struct HblankSync {
+    requested_seq: AtomicU64,
+    completed_seq: AtomicU64,
+}
+
+impl Default for FrameBuffers {
+    fn default() -> Self {
+        Self {
+            buffers: [vec![0; WIDTH * HEIGHT], vec![0; WIDTH * HEIGHT]],
+            work_index: 0,
+            completed_index: 1,
+            seq: 0,
+        }
+    }
 }
 
 impl Default for BgOffsetRaster {
@@ -95,7 +128,11 @@ impl KvmSharedMemory {
             bg_offset_scanline: Mutex::new(BgOffsetRaster::default()),
             bghofs_scanline_active: std::array::from_fn(|_| AtomicBool::new(false)),
             bgvofs_scanline_active: std::array::from_fn(|_| AtomicBool::new(false)),
+            frame_buffers: Mutex::new(FrameBuffers::default()),
+            completed_frame_seq: AtomicU64::new(0),
+            hblank_sync: HblankSync::default(),
             hblank_latch_vcount: AtomicU16::new(0xffff),
+            hblank_latch_seq: AtomicU64::new(0),
             hblank_pending_count: AtomicU64::new(0),
             interrupt_line: InterruptLine::new(vm_fd),
         };
@@ -155,19 +192,19 @@ impl KvmSharedMemory {
         }
     }
 
-    pub fn enter_hblank(&self) {
+    pub fn enter_hblank(&self) -> Option<u64> {
         let old_dispstat = self.read_io_u16(DISPSTAT);
         let dispstat = old_dispstat | DISPSTAT_HBLANK;
         self.write_io_u16(DISPSTAT, dispstat);
         if old_dispstat & DISPSTAT_HBLANK != 0 {
-            return;
+            return None;
         }
         let vcount = self.read_io_u16(VCOUNT);
         if dispstat & DISPSTAT_HBLANK_IRQ_ENABLE == 0
             || self.read_io_u16(DISPCNT) == 0
             || !(vcount < 160 || vcount == 227)
         {
-            return;
+            return None;
         }
         if self.read_io_u16(IF) & IRQ_HBLANK != 0 {
             if self.read_io_u16(IE) & IRQ_HBLANK != 0 && self.read_io_u16(IME) & 1 != 0 {
@@ -179,17 +216,110 @@ impl KvmSharedMemory {
                     self.read_io_u16(IME),
                 );
             }
-            return;
+            return None;
         }
         self.hblank_pending_count.store(0, Ordering::Relaxed);
+        let seq = self
+            .hblank_sync
+            .requested_seq
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
         self.hblank_latch_vcount.store(vcount, Ordering::Relaxed);
+        self.hblank_latch_seq.store(seq, Ordering::Release);
         self.prepare_fast_hblank(vcount);
         self.request_interrupt(IRQ_HBLANK);
         self.interrupt_line.pulse();
+        Some(seq)
     }
 
     pub fn tick_scanline(&self) {
         self.advance_timers(1_232);
+    }
+
+    pub fn render_scanline(&self, y: usize) {
+        if y >= HEIGHT {
+            return;
+        }
+
+        let mut ppu = self.ppu_from_registers();
+        {
+            let bg_offset = self
+                .bg_offset_scanline
+                .lock()
+                .expect("bg offset scanline lock poisoned");
+            for bg in 0..4 {
+                if self.bghofs_scanline_active[bg].load(Ordering::Relaxed) {
+                    ppu.write_bghofs_scanline(bg, y, bg_offset.hofs[bg][y]);
+                }
+                if self.bgvofs_scanline_active[bg].load(Ordering::Relaxed) {
+                    ppu.write_bgvofs_scanline(bg, y, bg_offset.vofs[bg][y]);
+                }
+            }
+        }
+
+        let mut line = [0; WIDTH];
+        ppu.render_mode0_scanline(y, self.palette.as_slice(), self.vram.as_slice(), &mut line);
+        let start = y * WIDTH;
+        let mut frame_buffers = self
+            .frame_buffers
+            .lock()
+            .expect("frame buffers lock poisoned");
+        let work_index = frame_buffers.work_index;
+        frame_buffers.buffers[work_index][start..start + WIDTH].copy_from_slice(&line);
+    }
+
+    pub fn publish_completed_frame(&self) {
+        let mut frame_buffers = self
+            .frame_buffers
+            .lock()
+            .expect("frame buffers lock poisoned");
+        frame_buffers.completed_index = frame_buffers.work_index;
+        frame_buffers.work_index = 1 - frame_buffers.completed_index;
+        frame_buffers.seq = frame_buffers.seq.wrapping_add(1);
+        self.completed_frame_seq
+            .store(frame_buffers.seq, Ordering::Release);
+    }
+
+    pub fn with_completed_frame<R>(&self, f: impl FnOnce(u64, &[u16]) -> R) -> R {
+        let frame_buffers = self
+            .frame_buffers
+            .lock()
+            .expect("frame buffers lock poisoned");
+        let frame = frame_buffers
+            .buffers
+            .get(frame_buffers.completed_index)
+            .expect("completed frame index out of range");
+        f(frame_buffers.seq, frame)
+    }
+
+    pub fn completed_frame_seq(&self) -> u64 {
+        self.completed_frame_seq.load(Ordering::Acquire)
+    }
+
+    pub fn hblank_irq_pending(&self) -> bool {
+        self.read_io_u16(IF) & IRQ_HBLANK != 0
+    }
+
+    pub fn wait_for_hblank_complete(&self, seq: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let completed_seq = self.hblank_sync.completed_seq.load(Ordering::Acquire);
+            if completed_seq >= seq {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                trace_hblank_wait_timeout(
+                    seq,
+                    completed_seq,
+                    self.read_io_u16(VCOUNT),
+                    self.read_io_u16(IE),
+                    self.read_io_u16(IF),
+                    self.read_io_u16(IME),
+                );
+                return false;
+            }
+            std::thread::sleep(Duration::from_micros(5));
+        }
     }
 
     pub fn set_keyinput(&self, value: u16) {
@@ -241,25 +371,14 @@ impl KvmSharedMemory {
             }
         }
         drop(bg_offset);
+        let seq = self.hblank_latch_seq.load(Ordering::Acquire);
+        self.hblank_sync.completed_seq.store(seq, Ordering::Release);
         trace_fast_hblank(vcount, bg1hofs, ack);
         self.update_interrupt_line();
     }
 
     pub fn render_frame(&self) -> FrameBuffer {
-        let mut ppu = Ppu::new();
-        ppu.write_dispcnt(self.read_io_u16(DISPCNT));
-        ppu.write_bgcnt(0, self.read_io_u16(BG0CNT));
-        ppu.write_bgcnt(1, self.read_io_u16(BG1CNT));
-        ppu.write_bgcnt(2, self.read_io_u16(BG2CNT));
-        ppu.write_bgcnt(3, self.read_io_u16(BG3CNT));
-        ppu.write_bghofs(0, self.read_io_u16(BG0HOFS));
-        ppu.write_bghofs(1, self.read_io_u16(BG1HOFS));
-        ppu.write_bghofs(2, self.read_io_u16(BG2HOFS));
-        ppu.write_bghofs(3, self.read_io_u16(BG3HOFS));
-        ppu.write_bgvofs(0, self.read_io_u16(BG0VOFS));
-        ppu.write_bgvofs(1, self.read_io_u16(BG1VOFS));
-        ppu.write_bgvofs(2, self.read_io_u16(BG2VOFS));
-        ppu.write_bgvofs(3, self.read_io_u16(BG3VOFS));
+        let mut ppu = self.ppu_from_registers();
         let bg_offset = self
             .bg_offset_scanline
             .lock()
@@ -297,6 +416,82 @@ impl KvmSharedMemory {
             self.vram.as_slice(),
             self.oam.as_slice(),
         )
+    }
+
+    fn ppu_from_registers(&self) -> Ppu {
+        let mut ppu = Ppu::new();
+        ppu.write_dispcnt(self.read_io_u16(DISPCNT));
+        ppu.write_bgcnt(0, self.read_io_u16(BG0CNT));
+        ppu.write_bgcnt(1, self.read_io_u16(BG1CNT));
+        ppu.write_bgcnt(2, self.read_io_u16(BG2CNT));
+        ppu.write_bgcnt(3, self.read_io_u16(BG3CNT));
+        ppu.write_bghofs(0, self.read_io_u16(BG0HOFS));
+        ppu.write_bghofs(1, self.read_io_u16(BG1HOFS));
+        ppu.write_bghofs(2, self.read_io_u16(BG2HOFS));
+        ppu.write_bghofs(3, self.read_io_u16(BG3HOFS));
+        ppu.write_bgvofs(0, self.read_io_u16(BG0VOFS));
+        ppu.write_bgvofs(1, self.read_io_u16(BG1VOFS));
+        ppu.write_bgvofs(2, self.read_io_u16(BG2VOFS));
+        ppu.write_bgvofs(3, self.read_io_u16(BG3VOFS));
+        ppu.write_bgpa(2, self.read_io_u16(BG2PA));
+        ppu.write_bgpb(2, self.read_io_u16(BG2PB));
+        ppu.write_bgpc(2, self.read_io_u16(BG2PC));
+        ppu.write_bgpd(2, self.read_io_u16(BG2PD));
+        ppu.write_bgx(2, self.read_io_u32(BG2X));
+        ppu.write_bgy(2, self.read_io_u32(BG2Y));
+        ppu.write_winh(0, self.read_io_u16(WIN0H));
+        ppu.write_winh(1, self.read_io_u16(WIN1H));
+        ppu.write_winv(0, self.read_io_u16(WIN0V));
+        ppu.write_winv(1, self.read_io_u16(WIN1V));
+        ppu.write_winin(self.read_io_u16(WININ));
+        ppu.write_winout(self.read_io_u16(WINOUT));
+        ppu.write_mosaic(self.read_io_u16(MOSAIC));
+        ppu.write_bldcnt(self.read_io_u16(BLDCNT));
+        ppu.write_bldalpha(self.read_io_u16(BLDALPHA));
+        ppu.write_bldy(self.read_io_u16(BLDY));
+        ppu
+    }
+
+    pub fn supports_scanline_renderer(&self) -> bool {
+        let dispcnt = self.read_io_u16(DISPCNT);
+        if dispcnt & DISPCNT_MODE_MASK != MODE_0 {
+            return false;
+        }
+        if dispcnt & (WIN0_ENABLE | WIN1_ENABLE | OBJ_WIN_ENABLE) != 0 {
+            return false;
+        }
+        if dispcnt & OBJ_ENABLE != 0 && self.has_renderable_obj() {
+            return false;
+        }
+        if self.read_io_u16(BLDCNT) != 0 {
+            return false;
+        }
+
+        for (bg, enable) in [BG0_ENABLE, BG1_ENABLE, BG2_ENABLE, BG3_ENABLE]
+            .into_iter()
+            .enumerate()
+        {
+            if dispcnt & enable != 0
+                && self.read_io_u16([BG0CNT, BG1CNT, BG2CNT, BG3CNT][bg]) & (1 << 6) != 0
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn has_renderable_obj(&self) -> bool {
+        self.oam.as_slice().chunks_exact(8).take(128).any(|obj| {
+            let attr0 = u16::from_le_bytes([obj[0], obj[1]]);
+            let affine = attr0 & (1 << 8) != 0;
+            if !affine && attr0 & (1 << 9) != 0 {
+                return false;
+            }
+            if ((attr0 >> 10) & 0x3) != 0 {
+                return false;
+            }
+            attr0 & (1 << 13) == 0
+        })
     }
 
     pub fn debug_video_state(&self) -> KvmVideoDebugState {

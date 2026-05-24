@@ -19,8 +19,8 @@ fn mode3_uses_vram_when_bg2_is_enabled() {
 
     let frame = ppu.render_mode3(&vram);
 
-    assert_eq!(frame[0], 0xffff0000);
-    assert_eq!(frame[1], 0xff000000);
+    assert_eq!(frame[0], rgb5(31, 0, 0));
+    assert_eq!(frame[1], 0);
 }
 
 #[test]
@@ -37,10 +37,10 @@ fn mode3_applies_bg2_mosaic() {
 
     let frame = ppu.render_mode3(&vram);
 
-    assert_eq!(frame[0], 0xffff0000);
-    assert_eq!(frame[1], 0xffff0000);
-    assert_eq!(frame[WIDTH], 0xffff0000);
-    assert_eq!(frame[WIDTH + 2], 0xff000000);
+    assert_eq!(frame[0], rgb5(31, 0, 0));
+    assert_eq!(frame[1], rgb5(31, 0, 0));
+    assert_eq!(frame[WIDTH], rgb5(31, 0, 0));
+    assert_eq!(frame[WIDTH + 2], 0);
 }
 
 #[test]
@@ -57,8 +57,8 @@ fn mode3_applies_bg2_affine_scaling() {
 
     let frame = ppu.render_mode3(&vram);
 
-    assert_eq!(frame[0], 0xffff0000);
-    assert_eq!(frame[1], 0xff0000ff);
+    assert_eq!(frame[0], rgb5(31, 0, 0));
+    assert_eq!(frame[1], rgb5(0, 0, 31));
 }
 
 #[test]
@@ -76,8 +76,8 @@ fn mode3_applies_bg2_affine_rotation_terms() {
 
     let frame = ppu.render_mode3(&vram);
 
-    assert_eq!(frame[WIDTH], 0xff00ff00);
-    assert_eq!(frame[1], 0xffff0000);
+    assert_eq!(frame[WIDTH], rgb5(0, 31, 0));
+    assert_eq!(frame[1], rgb5(31, 0, 0));
 }
 
 #[test]
@@ -93,10 +93,10 @@ fn mode4_uses_palette_and_selected_frame() {
     let mut ppu = Ppu::new();
     ppu.write_dispcnt(MODE_4 | BG2_ENABLE);
     let oam = vec![0; 0x400];
-    assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], 0xffff0000);
+    assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], rgb5(31, 0, 0));
 
     ppu.write_dispcnt(MODE_4 | BG2_ENABLE | BACKBUFFER);
-    assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], 0xff00ff00);
+    assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], rgb5(0, 31, 0));
 }
 
 #[test]
@@ -109,10 +109,10 @@ fn mode5_uses_16bpp_pixels_and_selected_frame() {
     let mut ppu = Ppu::new();
     ppu.write_dispcnt(MODE_5 | BG2_ENABLE);
     let oam = vec![0; 0x400];
-    assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], 0xffff0000);
+    assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], rgb5(31, 0, 0));
 
     ppu.write_dispcnt(MODE_5 | BG2_ENABLE | BACKBUFFER);
-    assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], 0xff0000ff);
+    assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], rgb5(0, 0, 31));
 }
 
 #[test]
@@ -130,8 +130,8 @@ fn mode0_renders_bg0_8bpp_text_tiles() {
 
     let frame = ppu.render_mode0(&palette, &vram);
 
-    assert_eq!(frame[0], 0xffff0000);
-    assert_eq!(frame[1], 0xff000000);
+    assert_eq!(frame[0], rgb5(31, 0, 0));
+    assert_eq!(frame[1], 0);
 }
 
 #[test]
@@ -153,8 +153,8 @@ fn mode0_composes_bg0_over_bg1_with_4bpp_palette_banks() {
 
     let frame = ppu.render_mode0(&palette, &vram);
 
-    assert_eq!(frame[0], 0xff00ff00);
-    assert_eq!(frame[1], 0xffff0000);
+    assert_eq!(frame[0], rgb5(0, 31, 0));
+    assert_eq!(frame[1], rgb5(31, 0, 0));
 }
 
 #[test]
@@ -175,7 +175,7 @@ fn mode0_treats_4bpp_color_zero_as_transparent_even_with_palette_bank() {
 
     let frame = ppu.render_mode0(&palette, &vram);
 
-    assert_eq!(frame[0], 0xffff0000);
+    assert_eq!(frame[0], rgb5(31, 0, 0));
 }
 
 #[test]
@@ -199,7 +199,7 @@ fn mode0_alpha_blends_top_and_lower_targets() {
 
     let frame = ppu.render_mode0(&palette, &vram);
 
-    assert_eq!(frame[0], bgr555_to_argb8888(rgb5(15, 0, 15)));
+    assert_eq!(frame[0], rgb5(15, 0, 15));
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn mode0_does_not_alpha_blend_when_lower_layer_is_not_targeted() {
 
     let frame = ppu.render_mode0(&palette, &vram);
 
-    assert_eq!(frame[0], 0xffff0000);
+    assert_eq!(frame[0], rgb5(31, 0, 0));
 }
 
 #[test]
@@ -251,10 +251,10 @@ fn mode0_win0_selects_different_backgrounds_inside_and_outside() {
 
     let frame = ppu.render_mode0(&palette, &vram);
 
-    assert_eq!(frame[19 * WIDTH + 20], 0xffff0000);
-    assert_eq!(frame[20 * WIDTH + 20], 0xff00ff00);
-    assert_eq!(frame[83 * WIDTH + 83], 0xff00ff00);
-    assert_eq!(frame[84 * WIDTH + 83], 0xffff0000);
+    assert_eq!(frame[19 * WIDTH + 20], rgb5(31, 0, 0));
+    assert_eq!(frame[20 * WIDTH + 20], rgb5(0, 31, 0));
+    assert_eq!(frame[83 * WIDTH + 83], rgb5(0, 31, 0));
+    assert_eq!(frame[84 * WIDTH + 83], rgb5(31, 0, 0));
 }
 
 #[test]
@@ -275,8 +275,8 @@ fn mode0_renders_4bpp_square_obj() {
     ppu.write_dispcnt(MODE_0 | OBJ_ENABLE);
     let frame = ppu.render_frame(&palette, &vram, &oam);
 
-    assert_eq!(frame[0], 0xffffffff);
-    assert_eq!(frame[2], 0xff000000);
+    assert_eq!(frame[0], rgb5(31, 31, 31));
+    assert_eq!(frame[2], 0);
 }
 
 #[test]
@@ -297,7 +297,7 @@ fn mode3_uses_bitmap_obj_tile_numbers_from_text_obj_base() {
     ppu.write_dispcnt(MODE_3 | BG2_ENABLE | OBJ_ENABLE | OBJ_1D_MAPPING);
     let frame = ppu.render_frame(&palette, &vram, &oam);
 
-    assert_eq!(frame[0], 0xffffffff);
+    assert_eq!(frame[0], rgb5(31, 31, 31));
 }
 
 #[test]
@@ -322,8 +322,8 @@ fn affine_obj_double_size_scales_source_pixels() {
     ppu.write_dispcnt(MODE_0 | OBJ_ENABLE | OBJ_1D_MAPPING);
     let frame = ppu.render_frame(&palette, &vram, &oam);
 
-    assert_eq!(frame[0], 0xffffffff);
-    assert_eq!(frame[24], 0xffffffff);
+    assert_eq!(frame[0], rgb5(31, 31, 31));
+    assert_eq!(frame[24], rgb5(31, 31, 31));
 }
 
 #[test]
@@ -346,7 +346,7 @@ fn attr2_palette_bank_selects_obj_palette_row() {
     ppu.write_dispcnt(MODE_0 | OBJ_ENABLE | OBJ_1D_MAPPING);
     let frame = ppu.render_frame(&palette, &vram, &oam);
 
-    assert_eq!(frame[0], 0xff00ff00);
+    assert_eq!(frame[0], rgb5(0, 31, 0));
 }
 
 #[test]
@@ -371,11 +371,11 @@ fn attr2_priority_and_oam_index_control_obj_order() {
 
     let mut ppu = Ppu::new();
     ppu.write_dispcnt(MODE_0 | OBJ_ENABLE | OBJ_1D_MAPPING);
-    assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], 0xff00ff00);
+    assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], rgb5(0, 31, 0));
 
     write_oam_halfword(&mut oam, 4, 0);
     write_oam_halfword(&mut oam, 12, 1);
-    assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], 0xffff0000);
+    assert_eq!(ppu.render_frame(&palette, &vram, &oam)[0], rgb5(31, 0, 0));
 }
 
 #[test]
@@ -396,7 +396,7 @@ fn obj_1d_mapping_uses_compact_rows() {
     ppu.write_dispcnt(MODE_0 | OBJ_ENABLE | OBJ_1D_MAPPING);
     let frame = ppu.render_frame(&palette, &vram, &oam);
 
-    assert_eq!(frame[WIDTH * 8], 0xffffffff);
+    assert_eq!(frame[WIDTH * 8], rgb5(31, 31, 31));
 }
 
 #[test]
@@ -421,13 +421,13 @@ fn mode3_renders_the_initial_sample_pattern() {
     ppu.write_dispcnt(MODE_3 | BG2_ENABLE);
     let frame = ppu.render_mode3(&vram);
 
-    assert_eq!(frame[5 * WIDTH + 5], 0xffffffff);
-    assert_eq!(frame[24 * WIDTH + 24], 0xffffffff);
-    assert_eq!(frame[50 * WIDTH + 20], 0xff000000);
-    assert_eq!(frame[50 * WIDTH + 82], 0xffff0000);
-    assert_eq!(frame[60 * WIDTH + 82], 0xff00ff00);
-    assert_eq!(frame[70 * WIDTH + 82], 0xff0000ff);
-    assert_eq!(frame[80 * WIDTH + 82], 0xffffffff);
+    assert_eq!(frame[5 * WIDTH + 5], rgb5(31, 31, 31));
+    assert_eq!(frame[24 * WIDTH + 24], rgb5(31, 31, 31));
+    assert_eq!(frame[50 * WIDTH + 20], 0);
+    assert_eq!(frame[50 * WIDTH + 82], rgb5(31, 0, 0));
+    assert_eq!(frame[60 * WIDTH + 82], rgb5(0, 31, 0));
+    assert_eq!(frame[70 * WIDTH + 82], rgb5(0, 0, 31));
+    assert_eq!(frame[80 * WIDTH + 82], rgb5(31, 31, 31));
 }
 
 #[test]
