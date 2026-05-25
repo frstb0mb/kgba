@@ -91,12 +91,13 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
     if headless {
         let duration_ms = duration_ms.unwrap_or(500);
         run_headless_input_script(&shared, duration_ms);
-        let (frame_hash, lit_pixels) = shared.with_completed_frame(|_, frame| {
-            (
-                frame_hash(frame),
-                frame.iter().filter(|&&pixel| pixel != 0).count(),
-            )
-        });
+        let frame = if shared.needs_scanline_renderer() {
+            shared.with_completed_frame(|_, frame| frame.to_vec())
+        } else {
+            shared.render_frame()
+        };
+        let frame_hash = frame_hash(&frame);
+        let lit_pixels = frame.iter().filter(|&&pixel| pixel != 0).count();
         let video = shared.debug_video_state();
         println!(
             "kgba kvm lit_pixels={} frame_hash={:#018x} dispcnt={:#06x} bg0cnt={:#06x} bg1cnt={:#06x} bg2cnt={:#06x} bg0hofs={:#06x} bg1hofs={:#06x} keyinput={:#06x} irq_waitflags={:#06x} mosaic={:#06x} dma3cnt={:#06x} vram0={:#06x} bg0_map_nonzero={} bg0_text_1={:#06x} bg0_text_2={:#06x} cycle_digits={}{} cx_digits={}{} bg1_raster_min={:#06x} bg1_raster_max={:#06x} bg1_raster_sample={:#06x} bg1_raster_checksum={}",
@@ -142,15 +143,22 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
             trace_video_input(keyinput, &mut last_keyinput);
             let now = Instant::now();
             if now >= next_present {
-                let seq = shared.completed_frame_seq();
-                if last_presented_seq != Some(seq) {
-                    let snapshot = shared.latest_frame_snapshot();
-                    let present_duration = video.present_timed(&snapshot.pixels)?;
-                    shared.record_sdl_present(present_duration);
-                    trace_video_frame(present_count, snapshot.seq, &snapshot.pixels, &shared);
-                    last_presented_seq = Some(snapshot.seq);
+                if shared.needs_scanline_renderer() {
+                    let seq = shared.completed_frame_seq();
+                    if last_presented_seq != Some(seq) {
+                        let snapshot = shared.latest_frame_snapshot();
+                        let present_duration = video.present_timed(&snapshot.pixels)?;
+                        shared.record_sdl_present(present_duration);
+                        trace_video_frame(present_count, snapshot.seq, &snapshot.pixels, &shared);
+                        last_presented_seq = Some(snapshot.seq);
+                    } else {
+                        trace_video_frame_skip(present_count, seq, &shared);
+                    }
                 } else {
-                    trace_video_frame_skip(present_count, seq, &shared);
+                    let frame = shared.render_frame();
+                    let present_duration = video.present_timed(&frame)?;
+                    shared.record_sdl_present(present_duration);
+                    trace_video_frame(present_count, shared.completed_frame_seq(), &frame, &shared);
                 }
                 present_count += 1;
                 next_present += FRAME_INTERVAL;
@@ -169,15 +177,22 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
     let mut last_keyinput = 0xffff;
     let result = video.run_frame_loop(
         |video, _| {
-            let seq = shared.completed_frame_seq();
-            if last_presented_seq != Some(seq) {
-                let snapshot = shared.latest_frame_snapshot();
-                let present_duration = video.present_timed(&snapshot.pixels)?;
-                shared.record_sdl_present(present_duration);
-                trace_video_frame(present_count, snapshot.seq, &snapshot.pixels, &shared);
-                last_presented_seq = Some(snapshot.seq);
+            if shared.needs_scanline_renderer() {
+                let seq = shared.completed_frame_seq();
+                if last_presented_seq != Some(seq) {
+                    let snapshot = shared.latest_frame_snapshot();
+                    let present_duration = video.present_timed(&snapshot.pixels)?;
+                    shared.record_sdl_present(present_duration);
+                    trace_video_frame(present_count, snapshot.seq, &snapshot.pixels, &shared);
+                    last_presented_seq = Some(snapshot.seq);
+                } else {
+                    trace_video_frame_skip(present_count, seq, &shared);
+                }
             } else {
-                trace_video_frame_skip(present_count, seq, &shared);
+                let frame = shared.render_frame();
+                let present_duration = video.present_timed(&frame)?;
+                shared.record_sdl_present(present_duration);
+                trace_video_frame(present_count, shared.completed_frame_seq(), &frame, &shared);
             }
             present_count += 1;
             Ok(())
@@ -197,9 +212,10 @@ fn run_vcount_clock(shared: Arc<kgba::kvm::KvmSharedMemory>, stop: Arc<AtomicBoo
     let mut vcount = 0u16;
     let mut next_tick = Instant::now();
     while !stop.load(Ordering::Relaxed) {
+        let needs_scanline_renderer = shared.needs_scanline_renderer();
         shared.set_vcount(vcount);
         shared.tick_scanline();
-        if vcount < 160 {
+        if vcount < 160 && needs_scanline_renderer {
             shared.render_scanline(usize::from(vcount));
         }
         wait_until(next_tick + hdraw, &stop);
@@ -213,16 +229,14 @@ fn run_vcount_clock(shared: Arc<kgba::kvm::KvmSharedMemory>, stop: Arc<AtomicBoo
         }
         vcount += 1;
         if vcount == 160 {
-            shared.publish_completed_frame();
+            if needs_scanline_renderer {
+                shared.publish_completed_frame();
+            }
         }
         if vcount >= TOTAL_SCANLINES {
             vcount = 0;
         }
         next_tick += scanline;
-        let now = Instant::now();
-        if next_tick < now {
-            next_tick = now;
-        }
         wait_until(next_tick, &stop);
     }
 }

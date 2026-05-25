@@ -740,6 +740,22 @@ impl KvmSharedMemory {
         true
     }
 
+    pub fn needs_scanline_renderer(&self) -> bool {
+        if self.read_io_u16(DISPSTAT) & DISPSTAT_HBLANK_IRQ_ENABLE != 0
+            && self.read_io_u16(IE) & IRQ_HBLANK != 0
+            && self.read_io_u16(IME) & 1 != 0
+        {
+            return true;
+        }
+        self.bghofs_scanline_active
+            .iter()
+            .any(|active| active.load(Ordering::Relaxed))
+            || self
+                .bgvofs_scanline_active
+                .iter()
+                .any(|active| active.load(Ordering::Relaxed))
+    }
+
     fn has_renderable_obj(&self) -> bool {
         self.oam.as_slice().chunks_exact(8).take(128).any(|obj| {
             let attr0 = u16::from_le_bytes([obj[0], obj[1]]);
