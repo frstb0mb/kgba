@@ -32,11 +32,24 @@ impl Timers {
         }
     }
 
-    pub fn advance(&mut self, cycles: u32, io: &MemoryRegion) {
-        let overflows = self.advance_timer(0, cycles, io);
-        let overflows = self.advance_cascade_timer(1, overflows, io);
-        let overflows = self.advance_cascade_timer(2, overflows, io);
-        self.advance_cascade_timer(3, overflows, io);
+    pub fn advance(&mut self, cycles: u32, io: &MemoryRegion) -> [u32; 4] {
+        let overflow0 = self.advance_timer(0, cycles, io);
+        let overflow1 = if self.timers[1].cascade() {
+            self.advance_cascade_timer(1, overflow0, io)
+        } else {
+            self.advance_timer(1, cycles, io)
+        };
+        let overflow2 = if self.timers[2].cascade() {
+            self.advance_cascade_timer(2, overflow1, io)
+        } else {
+            self.advance_timer(2, cycles, io)
+        };
+        let overflow3 = if self.timers[3].cascade() {
+            self.advance_cascade_timer(3, overflow2, io)
+        } else {
+            self.advance_timer(3, cycles, io)
+        };
+        [overflow0, overflow1, overflow2, overflow3]
     }
 
     fn advance_timer(&mut self, timer_index: usize, cycles: u32, io: &MemoryRegion) -> u32 {

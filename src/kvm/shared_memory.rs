@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     os::fd::RawFd,
     ptr,
     sync::{
@@ -12,9 +13,10 @@ use crate::gba::{
     memory_map::{
         BG0CNT, BG0HOFS, BG0VOFS, BG1CNT, BG1HOFS, BG1VOFS, BG2CNT, BG2HOFS, BG2PA, BG2PB, BG2PC,
         BG2PD, BG2VOFS, BG2X, BG2Y, BG3CNT, BG3HOFS, BG3VOFS, BLDALPHA, BLDCNT, BLDY, DISPCNT,
-        DISPSTAT, DMA0CNT, DMA0SAD, EWRAM_SIZE, EWRAM_START, GAME_PAK_ROM_START, IE, IF, IME,
-        IO_START, IWRAM_SIZE, IWRAM_START, KEYINPUT, MOSAIC, OAM_SIZE, OAM_START, PALETTE_SIZE,
-        PALETTE_START, VCOUNT, VRAM_SIZE, VRAM_START, WIN0H, WIN0V, WIN1H, WIN1V, WININ, WINOUT,
+        DISPSTAT, DMA0CNT, DMA0SAD, EWRAM_SIZE, EWRAM_START, FIFO_A, FIFO_B, GAME_PAK_ROM_START,
+        IE, IF, IME, IO_START, IWRAM_SIZE, IWRAM_START, KEYINPUT, MOSAIC, OAM_SIZE, OAM_START,
+        PALETTE_SIZE, PALETTE_START, SOUNDCNT_H, VCOUNT, VRAM_SIZE, VRAM_START, WIN0H, WIN0V,
+        WIN1H, WIN1V, WININ, WINOUT,
     },
     ppu::{
         BG0_ENABLE, BG1_ENABLE, BG2_ENABLE, BG3_ENABLE, DISPCNT_MODE_MASK, FrameBuffer, HEIGHT,
@@ -46,6 +48,7 @@ pub struct KvmSharedMemory {
     pub(super) fast: MemoryRegion,
     rom: Box<[u8]>,
     pub(super) timers: Mutex<Timers>,
+    audio: Mutex<AudioState>,
     bg_offset_scanline: Mutex<BgOffsetRaster>,
     bghofs_scanline_active: [AtomicBool; 4],
     bgvofs_scanline_active: [AtomicBool; 4],
@@ -82,6 +85,13 @@ struct FrameBuffers {
 struct HblankSync {
     requested_seq: AtomicU64,
     completed_seq: AtomicU64,
+}
+
+#[derive(Debug)]
+struct AudioState {
+    fifo_a: VecDeque<i8>,
+    fifo_b: VecDeque<i8>,
+    pcm: VecDeque<i16>,
 }
 
 #[derive(Debug, Default)]
@@ -158,6 +168,16 @@ impl Default for BgOffsetRaster {
     }
 }
 
+impl Default for AudioState {
+    fn default() -> Self {
+        Self {
+            fifo_a: VecDeque::with_capacity(AUDIO_FIFO_CAPACITY),
+            fifo_b: VecDeque::with_capacity(AUDIO_FIFO_CAPACITY),
+            pcm: VecDeque::with_capacity(AUDIO_PCM_CAPACITY),
+        }
+    }
+}
+
 impl KvmSharedMemory {
     pub fn new(
         ewram: MemoryRegion,
@@ -180,6 +200,7 @@ impl KvmSharedMemory {
             fast,
             rom: rom.to_vec().into_boxed_slice(),
             timers: Mutex::new(Timers::new()),
+            audio: Mutex::new(AudioState::default()),
             bg_offset_scanline: Mutex::new(BgOffsetRaster::default()),
             bghofs_scanline_active: std::array::from_fn(|_| AtomicBool::new(false)),
             bgvofs_scanline_active: std::array::from_fn(|_| AtomicBool::new(false)),
@@ -472,6 +493,13 @@ impl KvmSharedMemory {
         self.perf
             .sdl_present_us
             .fetch_add(duration_micros(duration), Ordering::Relaxed);
+    }
+
+    pub fn fill_audio_samples(&self, out: &mut [i16]) {
+        let mut audio = self.audio.lock().expect("audio lock poisoned");
+        for sample in out {
+            *sample = audio.pcm.pop_front().unwrap_or(0);
+        }
     }
 
     pub fn take_video_perf_snapshot(&self) -> VideoPerfSnapshot {
@@ -944,6 +972,7 @@ impl KvmSharedMemory {
                 self.read_io_u16(VCOUNT),
             );
         }
+        self.handle_audio_io_write(addr, len as u32, data);
         self.update_interrupt_line();
     }
 
@@ -980,10 +1009,16 @@ impl KvmSharedMemory {
     }
 
     fn advance_timers(&self, cycles: u32) {
-        self.timers
+        let overflows = self
+            .timers
             .lock()
             .expect("timer lock poisoned")
             .advance(cycles, &self.io);
+        for (timer, count) in overflows.into_iter().enumerate() {
+            for _ in 0..count {
+                self.on_timer_overflow(timer);
+            }
+        }
     }
 
     fn request_interrupt(&self, interrupt: u16) {
@@ -1028,6 +1063,130 @@ impl KvmSharedMemory {
         if control & DMA_REPEAT == 0 {
             self.write_io_u16(base + 10, control & !DMA_ENABLE);
         }
+    }
+
+    fn run_fifo_dma_for_timer(&self, timer: usize) {
+        for channel in 1..=2 {
+            let base = DMA0SAD + channel as u32 * 12;
+            let control = self.read_io_u16(base + 10);
+            if control & DMA_ENABLE == 0
+                || control & DMA_TIMING_MASK != DMA_TIMING_SPECIAL
+                || control & DMA_32BIT == 0
+            {
+                continue;
+            }
+
+            let destination = self.read_io_u32(base + 4);
+            let fifo = match destination {
+                FIFO_A => 0,
+                FIFO_B => 1,
+                _ => continue,
+            };
+            if self.sound_fifo_timer(fifo) != timer {
+                continue;
+            }
+            if self.sound_fifo_len(fifo) > AUDIO_FIFO_DMA_THRESHOLD {
+                continue;
+            }
+
+            let mut source = self.read_io_u32(base);
+            for _ in 0..4 {
+                let low = self.dma_read_halfword(source);
+                let high = self.dma_read_halfword(source.wrapping_add(2));
+                self.push_fifo_word(fifo, low, high);
+                source = source.wrapping_add(4);
+            }
+            self.write_io_u16(base, source as u16);
+            self.write_io_u16(base + 2, (source >> 16) as u16);
+        }
+    }
+
+    fn on_timer_overflow(&self, timer: usize) {
+        self.run_fifo_dma_for_timer(timer);
+        let soundcnt_h = self.read_io_u16(SOUNDCNT_H);
+        let mut audio = self.audio.lock().expect("audio lock poisoned");
+        let mut left = 0i32;
+        let mut right = 0i32;
+
+        if self.sound_fifo_timer(0) == timer {
+            let sample = i32::from(audio.fifo_a.pop_front().unwrap_or(0)) << 8;
+            if soundcnt_h & SOUND_A_LEFT != 0 {
+                left += sample;
+            }
+            if soundcnt_h & SOUND_A_RIGHT != 0 {
+                right += sample;
+            }
+        }
+        if self.sound_fifo_timer(1) == timer {
+            let sample = i32::from(audio.fifo_b.pop_front().unwrap_or(0)) << 8;
+            if soundcnt_h & SOUND_B_LEFT != 0 {
+                left += sample;
+            }
+            if soundcnt_h & SOUND_B_RIGHT != 0 {
+                right += sample;
+            }
+        }
+
+        push_pcm_sample(&mut audio.pcm, left);
+        push_pcm_sample(&mut audio.pcm, right);
+    }
+
+    fn sound_fifo_timer(&self, fifo: usize) -> usize {
+        let soundcnt_h = self.read_io_u16(SOUNDCNT_H);
+        if fifo == 0 {
+            usize::from((soundcnt_h & SOUND_A_TIMER) != 0)
+        } else {
+            usize::from((soundcnt_h & SOUND_B_TIMER) != 0)
+        }
+    }
+
+    fn sound_fifo_len(&self, fifo: usize) -> usize {
+        let audio = self.audio.lock().expect("audio lock poisoned");
+        if fifo == 0 {
+            audio.fifo_a.len()
+        } else {
+            audio.fifo_b.len()
+        }
+    }
+
+    fn handle_audio_io_write(&self, addr: u32, len: u32, data: &[u8; 8]) {
+        if let Some(write) = io_register_write(SOUNDCNT_H, addr, len, data) {
+            let mut audio = self.audio.lock().expect("audio lock poisoned");
+            if write.value & SOUND_A_RESET != 0 {
+                audio.fifo_a.clear();
+            }
+            if write.value & SOUND_B_RESET != 0 {
+                audio.fifo_b.clear();
+            }
+        }
+
+        for byte_index in 0..len as usize {
+            let byte_addr = addr + byte_index as u32;
+            if (FIFO_A..FIFO_A + 4).contains(&byte_addr) {
+                self.push_fifo_byte(0, data[byte_index] as i8);
+            } else if (FIFO_B..FIFO_B + 4).contains(&byte_addr) {
+                self.push_fifo_byte(1, data[byte_index] as i8);
+            }
+        }
+    }
+
+    fn push_fifo_word(&self, fifo: usize, low: u16, high: u16) {
+        for byte in low.to_le_bytes().into_iter().chain(high.to_le_bytes()) {
+            self.push_fifo_byte(fifo, byte as i8);
+        }
+    }
+
+    fn push_fifo_byte(&self, fifo: usize, sample: i8) {
+        let mut audio = self.audio.lock().expect("audio lock poisoned");
+        let queue = if fifo == 0 {
+            &mut audio.fifo_a
+        } else {
+            &mut audio.fifo_b
+        };
+        if queue.len() >= AUDIO_FIFO_CAPACITY {
+            queue.pop_front();
+        }
+        queue.push_back(sample);
     }
 
     fn run_dma(
@@ -1080,6 +1239,16 @@ impl KvmSharedMemory {
     }
 
     fn dma_write_halfword(&self, addr: u32, value: u16) {
+        if (FIFO_A..FIFO_A + 4).contains(&addr) {
+            self.push_fifo_byte(0, value as u8 as i8);
+            self.push_fifo_byte(0, (value >> 8) as u8 as i8);
+            return;
+        }
+        if (FIFO_B..FIFO_B + 4).contains(&addr) {
+            self.push_fifo_byte(1, value as u8 as i8);
+            self.push_fifo_byte(1, (value >> 8) as u8 as i8);
+            return;
+        }
         let Some((memory, offset)) = dma_memory_region_mut(self, addr) else {
             return;
         };
@@ -1143,6 +1312,18 @@ const DMA_ENABLE: u16 = 1 << 15;
 const DMA_REPEAT: u16 = 1 << 9;
 const DMA_32BIT: u16 = 1 << 10;
 const DMA_TIMING_MASK: u16 = 0x3000;
+const DMA_TIMING_SPECIAL: u16 = 0x3000;
+const SOUND_A_RIGHT: u16 = 1 << 8;
+const SOUND_A_LEFT: u16 = 1 << 9;
+const SOUND_A_TIMER: u16 = 1 << 10;
+const SOUND_A_RESET: u16 = 1 << 11;
+const SOUND_B_RIGHT: u16 = 1 << 12;
+const SOUND_B_LEFT: u16 = 1 << 13;
+const SOUND_B_TIMER: u16 = 1 << 14;
+const SOUND_B_RESET: u16 = 1 << 15;
+const AUDIO_FIFO_CAPACITY: usize = 32;
+const AUDIO_FIFO_DMA_THRESHOLD: usize = 16;
+const AUDIO_PCM_CAPACITY: usize = 16_384;
 
 #[derive(Debug)]
 struct InterruptLine {
@@ -1230,6 +1411,13 @@ fn duration_micros(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+fn push_pcm_sample(pcm: &mut VecDeque<i16>, sample: i32) {
+    if pcm.len() >= AUDIO_PCM_CAPACITY {
+        pcm.pop_front();
+    }
+    pcm.push_back(sample.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1241,7 +1429,8 @@ mod tests {
     };
     use crate::{
         gba::memory_map::{
-            BG1HOFS, BG1VOFS, DMA3CNT, DMA3DAD, DMA3SAD, EWRAM_SIZE, IF, IME, IWRAM_SIZE, OAM_SIZE,
+            BG1HOFS, BG1VOFS, DMA2CNT, DMA2DAD, DMA2SAD, DMA3CNT, DMA3DAD, DMA3SAD, EWRAM_SIZE,
+            FIFO_B, IF, IME, IO_START, IWRAM_SIZE, OAM_SIZE, SOUNDCNT_H,
         },
         kvm::memory::MemoryRegion,
     };
@@ -1333,6 +1522,32 @@ mod tests {
             .expect("bg offset scanline lock poisoned");
         assert_eq!(bg_offset.hofs[1][8], 0x0042);
         assert_eq!(bg_offset.vofs[1][8], 0x0017);
+    }
+
+    #[test]
+    fn timer_overflow_runs_fifo_dma_and_publishes_pcm() {
+        let rom = [0x40, 0xc0, 0x20, 0xe0, 0x10, 0xf0, 0x08, 0xf8];
+        let shared = test_shared_memory(&rom);
+        shared.write_io_u16(SOUNDCNT_H, 0x7000);
+        shared.write_io_u16(DMA2SAD, GAME_PAK_ROM_START as u16);
+        shared.write_io_u16(DMA2SAD + 2, (GAME_PAK_ROM_START >> 16) as u16);
+        shared.write_io_u16(DMA2DAD, FIFO_B as u16);
+        shared.write_io_u16(DMA2DAD + 2, (FIFO_B >> 16) as u16);
+        shared.write_io_u16(DMA2CNT, 0);
+        shared.write_io_u16(DMA2CNT + 2, 0xb600);
+        shared.write_io_u16(IO_START + 0x0104, 0xffff);
+        shared.write_io_u16(IO_START + 0x0106, 0x0080);
+        shared.write_timer_registers_from_io(IO_START + 0x0104, 4);
+
+        shared.advance_timers(1);
+
+        let mut samples = [0; 2];
+        shared.fill_audio_samples(&mut samples);
+        assert_eq!(samples, [0x4000, 0x4000]);
+        assert_eq!(
+            shared.read_io_u16(DMA2SAD),
+            (GAME_PAK_ROM_START + 16) as u16
+        );
     }
 
     fn test_shared_memory(rom: &[u8]) -> KvmSharedMemory {

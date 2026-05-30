@@ -16,7 +16,7 @@ use kgba::{
         software::{RunResult, SoftwareRunner},
     },
     kvm::KvmGba,
-    platform::sdl::Video,
+    platform::sdl::{Audio, Video},
 };
 
 const USAGE: &str = "\
@@ -131,6 +131,7 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
     }
 
     let mut video = Video::new("kgba - KVM mode 3")?;
+    let _audio = Audio::new(Arc::clone(&shared))?;
     if let Some(duration_ms) = duration_ms {
         let started = Instant::now();
         let mut next_present = Instant::now();

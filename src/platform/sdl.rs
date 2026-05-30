@@ -1,17 +1,23 @@
 use std::{
     ffi::{CString, c_char, c_int, c_void},
     ptr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use crate::gba::ppu::{HEIGHT, WIDTH};
+use crate::{
+    gba::ppu::{HEIGHT, WIDTH},
+    kvm::KvmSharedMemory,
+};
 
+const SDL_INIT_AUDIO: u32 = 0x0000_0010;
 const SDL_INIT_VIDEO: u32 = 0x0000_0020;
 const SDL_WINDOW_SHOWN: u32 = 0x0000_0004;
 const SDL_RENDERER_SOFTWARE: u32 = 0x0000_0001;
 const SDL_RENDERER_ACCELERATED: u32 = 0x0000_0002;
 const SDL_TEXTUREACCESS_STREAMING: c_int = 1;
 const SDL_PIXELFORMAT_BGR555: u32 = 357_764_866;
+const AUDIO_S16LSB: u16 = 0x8010;
 const SDL_QUIT: u32 = 0x100;
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_742);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -45,6 +51,22 @@ struct SDL_Window(c_void);
 struct SDL_Renderer(c_void);
 #[repr(C)]
 struct SDL_Texture(c_void);
+
+type SdlAudioDeviceId = u32;
+type SdlAudioCallback = Option<unsafe extern "C" fn(*mut c_void, *mut u8, c_int)>;
+
+#[repr(C)]
+struct SDL_AudioSpec {
+    freq: c_int,
+    format: u16,
+    channels: u8,
+    silence: u8,
+    samples: u16,
+    padding: u16,
+    size: u32,
+    callback: SdlAudioCallback,
+    userdata: *mut c_void,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -95,12 +117,81 @@ unsafe extern "C" {
     fn SDL_PollEvent(event: *mut SDL_Event) -> c_int;
     fn SDL_PumpEvents();
     fn SDL_GetKeyboardState(numkeys: *mut c_int) -> *const u8;
+    fn SDL_OpenAudioDevice(
+        device: *const c_char,
+        iscapture: c_int,
+        desired: *const SDL_AudioSpec,
+        obtained: *mut SDL_AudioSpec,
+        allowed_changes: c_int,
+    ) -> SdlAudioDeviceId;
+    fn SDL_PauseAudioDevice(dev: SdlAudioDeviceId, pause_on: c_int);
+    fn SDL_CloseAudioDevice(dev: SdlAudioDeviceId);
 }
 
 pub struct Video {
     window: *mut SDL_Window,
     renderer: *mut SDL_Renderer,
     texture: *mut SDL_Texture,
+}
+
+pub struct Audio {
+    device: SdlAudioDeviceId,
+    state: *mut AudioState,
+}
+
+struct AudioState {
+    shared: Arc<KvmSharedMemory>,
+}
+
+impl Audio {
+    pub fn new(shared: Arc<KvmSharedMemory>) -> Result<Self, String> {
+        unsafe {
+            if SDL_Init(SDL_INIT_AUDIO) != 0 {
+                return Err(sdl_error());
+            }
+
+            let state = Box::into_raw(Box::new(AudioState { shared }));
+            let desired = SDL_AudioSpec {
+                freq: 16_384,
+                format: AUDIO_S16LSB,
+                channels: 2,
+                silence: 0,
+                samples: 512,
+                padding: 0,
+                size: 0,
+                callback: Some(audio_callback),
+                userdata: state.cast(),
+            };
+            let mut obtained = SDL_AudioSpec {
+                freq: 0,
+                format: 0,
+                channels: 0,
+                silence: 0,
+                samples: 0,
+                padding: 0,
+                size: 0,
+                callback: None,
+                userdata: ptr::null_mut(),
+            };
+            let device = SDL_OpenAudioDevice(ptr::null(), 0, &desired, &mut obtained, 0);
+            if device == 0 {
+                drop(Box::from_raw(state));
+                return Err(sdl_error());
+            }
+            SDL_PauseAudioDevice(device, 0);
+
+            Ok(Self { device, state })
+        }
+    }
+}
+
+impl Drop for Audio {
+    fn drop(&mut self) {
+        unsafe {
+            SDL_CloseAudioDevice(self.device);
+            drop(Box::from_raw(self.state));
+        }
+    }
 }
 
 impl Video {
@@ -251,6 +342,16 @@ impl Drop for Video {
             SDL_Quit();
         }
     }
+}
+
+unsafe extern "C" fn audio_callback(userdata: *mut c_void, stream: *mut u8, len: c_int) {
+    if userdata.is_null() || stream.is_null() || len <= 0 {
+        return;
+    }
+
+    let state = unsafe { &*(userdata as *const AudioState) };
+    let samples = unsafe { std::slice::from_raw_parts_mut(stream.cast::<i16>(), len as usize / 2) };
+    state.shared.fill_audio_samples(samples);
 }
 
 fn read_keyinput() -> u16 {
