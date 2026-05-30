@@ -133,6 +133,8 @@ vblank_intr_wait:
     mov r1, #1
 intr_wait:
     ldr r2, reg_irq_waitflags_ptr
+    mrs r3, spsr
+    stmdb sp!, {r3, lr}
     cmp r0, #0
     beq intr_wait_loop
     ldrh r3, [r2]
@@ -149,6 +151,8 @@ intr_wait_poll:
     mrs r3, cpsr
     orr r3, r3, #0x80
     msr cpsr_c, r3
+    ldmia sp!, {r3, lr}
+    msr spsr, r3
     movs pc, lr
 reg_irq_waitflags_ptr:
     .word REG_IRQ_WAITFLAGS
