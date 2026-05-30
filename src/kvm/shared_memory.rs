@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    env,
     os::fd::RawFd,
     ptr,
     sync::{
@@ -49,6 +50,7 @@ pub struct KvmSharedMemory {
     rom: Box<[u8]>,
     pub(super) timers: Mutex<Timers>,
     audio: Mutex<AudioState>,
+    audio_trace: AudioTraceCounters,
     bg_offset_scanline: Mutex<BgOffsetRaster>,
     bghofs_scanline_active: [AtomicBool; 4],
     bgvofs_scanline_active: [AtomicBool; 4],
@@ -92,6 +94,20 @@ struct AudioState {
     fifo_a: VecDeque<i8>,
     fifo_b: VecDeque<i8>,
     pcm: VecDeque<i16>,
+    fifo_dma_source: [u32; 4],
+    fifo_dma_start: [u32; 4],
+    fifo_dma_end: [u32; 4],
+}
+
+#[derive(Debug, Default)]
+struct AudioTraceCounters {
+    callback_samples: AtomicU64,
+    underflow_samples: AtomicU64,
+    produced_samples: AtomicU64,
+    fifo_dma_words: AtomicU64,
+    fifo_dma_nonzero_bytes: AtomicU64,
+    output_sum_abs: AtomicU64,
+    output_changes: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -174,6 +190,9 @@ impl Default for AudioState {
             fifo_a: VecDeque::with_capacity(AUDIO_FIFO_CAPACITY),
             fifo_b: VecDeque::with_capacity(AUDIO_FIFO_CAPACITY),
             pcm: VecDeque::with_capacity(AUDIO_PCM_CAPACITY),
+            fifo_dma_source: [0; 4],
+            fifo_dma_start: [0; 4],
+            fifo_dma_end: [0; 4],
         }
     }
 }
@@ -201,6 +220,7 @@ impl KvmSharedMemory {
             rom: rom.to_vec().into_boxed_slice(),
             timers: Mutex::new(Timers::new()),
             audio: Mutex::new(AudioState::default()),
+            audio_trace: AudioTraceCounters::default(),
             bg_offset_scanline: Mutex::new(BgOffsetRaster::default()),
             bghofs_scanline_active: std::array::from_fn(|_| AtomicBool::new(false)),
             bgvofs_scanline_active: std::array::from_fn(|_| AtomicBool::new(false)),
@@ -309,8 +329,10 @@ impl KvmSharedMemory {
         Some(seq)
     }
 
-    pub fn tick_scanline(&self) {
-        self.advance_timers(1_232);
+    pub fn tick_scanline(&self) {}
+
+    pub fn tick_audio_cycles(&self, cycles: u32) {
+        self.advance_timers(cycles);
     }
 
     pub fn render_scanline(&self, y: usize) {
@@ -497,8 +519,57 @@ impl KvmSharedMemory {
 
     pub fn fill_audio_samples(&self, out: &mut [i16]) {
         let mut audio = self.audio.lock().expect("audio lock poisoned");
-        for sample in out {
-            *sample = audio.pcm.pop_front().unwrap_or(0);
+        let mut underflows = 0u64;
+        let mut sum_abs = 0u64;
+        let mut changes = 0u64;
+        let mut previous = None;
+        let out_len = out.len();
+        for sample in &mut *out {
+            if let Some(value) = audio.pcm.pop_front() {
+                *sample = value;
+            } else {
+                *sample = 0;
+                underflows += 1;
+            }
+            sum_abs += u64::from(sample.unsigned_abs());
+            if previous.is_some_and(|previous| previous != *sample) {
+                changes += 1;
+            }
+            previous = Some(*sample);
+        }
+        self.audio_trace
+            .callback_samples
+            .fetch_add(out_len as u64, Ordering::Relaxed);
+        self.audio_trace
+            .underflow_samples
+            .fetch_add(underflows, Ordering::Relaxed);
+        self.audio_trace
+            .output_sum_abs
+            .fetch_add(sum_abs, Ordering::Relaxed);
+        self.audio_trace
+            .output_changes
+            .fetch_add(changes, Ordering::Relaxed);
+        if env::var_os("KGBA_TRACE_AUDIO").is_some() {
+            let callbacks = self.audio_trace.callback_samples.load(Ordering::Relaxed);
+            if callbacks / 16_384 != callbacks.saturating_sub(out_len as u64) / 16_384 {
+                eprintln!(
+                    "kgba audio callback_samples={} underflows={} produced={} fifo_dma_words={} fifo_dma_nonzero_bytes={} sum_abs={} changes={} fifo_a={} fifo_b={} pcm={}",
+                    callbacks,
+                    self.audio_trace
+                        .underflow_samples
+                        .swap(0, Ordering::Relaxed),
+                    self.audio_trace.produced_samples.swap(0, Ordering::Relaxed),
+                    self.audio_trace.fifo_dma_words.swap(0, Ordering::Relaxed),
+                    self.audio_trace
+                        .fifo_dma_nonzero_bytes
+                        .swap(0, Ordering::Relaxed),
+                    self.audio_trace.output_sum_abs.swap(0, Ordering::Relaxed),
+                    self.audio_trace.output_changes.swap(0, Ordering::Relaxed),
+                    audio.fifo_a.len(),
+                    audio.fifo_b.len(),
+                    audio.pcm.len()
+                );
+            }
         }
     }
 
@@ -829,6 +900,7 @@ impl KvmSharedMemory {
             irq_waitflags: self.read_iwram_u16(0x7ff8),
             mosaic: self.read_io_u16(MOSAIC),
             dma3cnt: self.read_io_u16(DMA0CNT + 3 * 12 + 2),
+            palette0: u16::from_le_bytes([self.palette.as_slice()[0], self.palette.as_slice()[1]]),
             vram0: u16::from_le_bytes([self.vram.as_slice()[0], self.vram.as_slice()[1]]),
             bg0_map_nonzero: self.count_bg_map_nonzero(29),
             bg0_text_1: self.read_vram_u16(29 * 0x800 + (1 + 1 * 32) * 2),
@@ -841,12 +913,75 @@ impl KvmSharedMemory {
             bg1_raster_max: bg1_max,
             bg1_raster_sample: bg1_sample,
             bg1_raster_checksum: bg1_checksum,
+            audio_dma1sad: self.read_io_u32(DMA0SAD + 12),
+            audio_dma2sad: self.read_io_u32(DMA0SAD + 2 * 12),
+            audio_dma1cnt: self.read_io_u16(DMA0SAD + 12 + 10),
+            audio_dma2cnt: self.read_io_u16(DMA0SAD + 2 * 12 + 10),
+            audio_wave_left_nonzero: self.audio_region_nonzero(self.read_io_u32(DMA0SAD + 12), 528),
+            audio_wave_right_nonzero: self
+                .audio_region_nonzero(self.read_io_u32(DMA0SAD + 2 * 12), 528),
+            maxmod_wavebuffer_var: self.find_iwram_word(self.read_io_u32(DMA0SAD + 12)),
+            maxmod_writepos: self
+                .find_iwram_word(self.read_io_u32(DMA0SAD + 12))
+                .map(|offset| self.read_iwram_u32(offset.saturating_sub(12)))
+                .unwrap_or(0),
+            maxmod_mixlen: self
+                .find_iwram_word(self.read_io_u32(DMA0SAD + 12))
+                .map(|offset| self.read_iwram_u32(offset + 4))
+                .unwrap_or(0),
+            maxmod_mix_seg: self
+                .find_iwram_word(self.read_io_u32(DMA0SAD + 12))
+                .and_then(|offset| self.iwram.as_slice().get(offset + 28).copied())
+                .unwrap_or(0),
         }
+    }
+
+    pub fn debug_read_u32(&self, addr: u32) -> Option<u32> {
+        if (GAME_PAK_ROM_START..GAME_PAK_ROM_START + self.rom.len() as u32).contains(&addr) {
+            let offset = (addr - GAME_PAK_ROM_START) as usize;
+            return self
+                .rom
+                .get(offset..offset + 4)
+                .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        }
+        dma_memory_region(self, addr).and_then(|(memory, offset)| {
+            memory
+                .get(offset..offset + 4)
+                .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        })
+    }
+
+    fn find_iwram_word(&self, value: u32) -> Option<usize> {
+        self.iwram
+            .as_slice()
+            .windows(4)
+            .position(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) == value)
+    }
+
+    fn audio_region_nonzero(&self, addr: u32, len: usize) -> usize {
+        dma_memory_region(self, addr).map_or(0, |(memory, offset)| {
+            memory
+                .get(offset..offset.saturating_add(len).min(memory.len()))
+                .unwrap_or(&[])
+                .iter()
+                .filter(|&&byte| byte != 0)
+                .count()
+        })
     }
 
     fn read_iwram_u16(&self, offset: usize) -> u16 {
         let iwram = self.iwram.as_slice();
         u16::from_le_bytes([iwram[offset], iwram[offset + 1]])
+    }
+
+    fn read_iwram_u32(&self, offset: usize) -> u32 {
+        let iwram = self.iwram.as_slice();
+        u32::from_le_bytes([
+            iwram[offset],
+            iwram[offset + 1],
+            iwram[offset + 2],
+            iwram[offset + 3],
+        ])
     }
 
     fn read_vram_u16(&self, offset: usize) -> u16 {
@@ -978,6 +1113,7 @@ impl KvmSharedMemory {
 
     pub(super) fn run_immediate_dma_for_io_write(&self, addr: u32, len: u32) {
         for register in (addr..addr + len).step_by(2) {
+            self.update_fifo_dma_source_for_control_write(register);
             self.run_immediate_dma_if_enabled(register);
         }
     }
@@ -1089,15 +1225,85 @@ impl KvmSharedMemory {
                 continue;
             }
 
-            let mut source = self.read_io_u32(base);
+            let mut audio = self.audio.lock().expect("audio lock poisoned");
+            if audio.fifo_dma_source[channel] == 0 {
+                audio.fifo_dma_source[channel] = self.read_io_u32(base);
+            }
+            let source_start = audio.fifo_dma_start[channel];
+            let source_end = audio.fifo_dma_end[channel];
+            let mut source = audio.fifo_dma_source[channel];
+            drop(audio);
+
             for _ in 0..4 {
+                if source_end > source_start && source >= source_end {
+                    source = source_start;
+                }
                 let low = self.dma_read_halfword(source);
                 let high = self.dma_read_halfword(source.wrapping_add(2));
+                let nonzero_bytes = low
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain(high.to_le_bytes())
+                    .filter(|byte| *byte != 0)
+                    .count() as u64;
+                self.audio_trace
+                    .fifo_dma_nonzero_bytes
+                    .fetch_add(nonzero_bytes, Ordering::Relaxed);
                 self.push_fifo_word(fifo, low, high);
                 source = source.wrapping_add(4);
             }
-            self.write_io_u16(base, source as u16);
-            self.write_io_u16(base + 2, (source >> 16) as u16);
+            self.audio_trace
+                .fifo_dma_words
+                .fetch_add(4, Ordering::Relaxed);
+
+            let mut audio = self.audio.lock().expect("audio lock poisoned");
+            audio.fifo_dma_source[channel] = source;
+        }
+    }
+
+    fn update_fifo_dma_source_for_control_write(&self, addr: u32) {
+        let Some(channel) = dma_channel_for_cnt_high(addr) else {
+            return;
+        };
+        if !(1..=2).contains(&channel) {
+            return;
+        }
+
+        let base = DMA0SAD + channel as u32 * 12;
+        let control = self.read_io_u16(base + 10);
+        if control & DMA_ENABLE == 0 {
+            let mut audio = self.audio.lock().expect("audio lock poisoned");
+            audio.fifo_dma_source[channel] = 0;
+            return;
+        }
+        if control & DMA_TIMING_MASK == DMA_TIMING_SPECIAL {
+            let source = self.read_io_u32(base);
+            let mut audio = self.audio.lock().expect("audio lock poisoned");
+            audio.fifo_dma_source[channel] = source;
+            audio.fifo_dma_start[channel] = source;
+            audio.fifo_dma_end[channel] = self.infer_fifo_dma_end(channel, source);
+        }
+    }
+
+    fn infer_fifo_dma_end(&self, channel: usize, source: u32) -> u32 {
+        let dma1_source = self.read_io_u32(DMA0SAD + 12);
+        let dma2_source = self.read_io_u32(DMA0SAD + 2 * 12);
+        if dma2_source > dma1_source {
+            let channel_len = dma2_source - dma1_source;
+            if channel == 1 {
+                return dma2_source;
+            }
+            if channel == 2 {
+                return source + channel_len;
+            }
+        }
+
+        if (IWRAM_START..IWRAM_START + IWRAM_SIZE as u32).contains(&source) {
+            IWRAM_START + IWRAM_SIZE as u32
+        } else if (EWRAM_START..EWRAM_START + EWRAM_SIZE as u32).contains(&source) {
+            EWRAM_START + EWRAM_SIZE as u32
+        } else {
+            0
         }
     }
 
@@ -1129,6 +1335,9 @@ impl KvmSharedMemory {
 
         push_pcm_sample(&mut audio.pcm, left);
         push_pcm_sample(&mut audio.pcm, right);
+        self.audio_trace
+            .produced_samples
+            .fetch_add(2, Ordering::Relaxed);
     }
 
     fn sound_fifo_timer(&self, fifo: usize) -> usize {
@@ -1270,6 +1479,7 @@ pub struct KvmVideoDebugState {
     pub irq_waitflags: u16,
     pub mosaic: u16,
     pub dma3cnt: u16,
+    pub palette0: u16,
     pub vram0: u16,
     pub bg0_map_nonzero: usize,
     pub bg0_text_1: u16,
@@ -1282,6 +1492,16 @@ pub struct KvmVideoDebugState {
     pub bg1_raster_max: u16,
     pub bg1_raster_sample: u16,
     pub bg1_raster_checksum: u32,
+    pub audio_dma1sad: u32,
+    pub audio_dma2sad: u32,
+    pub audio_dma1cnt: u16,
+    pub audio_dma2cnt: u16,
+    pub audio_wave_left_nonzero: usize,
+    pub audio_wave_right_nonzero: usize,
+    pub maxmod_wavebuffer_var: Option<usize>,
+    pub maxmod_writepos: u32,
+    pub maxmod_mixlen: u32,
+    pub maxmod_mix_seg: u8,
 }
 
 const DISPSTAT_VBLANK: u16 = 1 << 0;
@@ -1544,10 +1764,7 @@ mod tests {
         let mut samples = [0; 2];
         shared.fill_audio_samples(&mut samples);
         assert_eq!(samples, [0x4000, 0x4000]);
-        assert_eq!(
-            shared.read_io_u16(DMA2SAD),
-            (GAME_PAK_ROM_START + 16) as u16
-        );
+        assert_eq!(shared.read_io_u16(DMA2SAD), GAME_PAK_ROM_START as u16);
     }
 
     fn test_shared_memory(rom: &[u8]) -> KvmSharedMemory {

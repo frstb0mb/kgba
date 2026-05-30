@@ -49,6 +49,7 @@ pub const KVM_CREATE_VCPU: c_ulong = io(KVMIO, 0x41);
 pub const KVM_SET_USER_MEMORY_REGION: c_ulong = iow::<KvmUserspaceMemoryRegion>(KVMIO, 0x46);
 pub const KVM_RUN: c_ulong = io(KVMIO, 0x80);
 pub const KVM_IRQ_LINE: c_ulong = iow::<KvmIrqLevel>(KVMIO, 0x61);
+pub const KVM_GET_ONE_REG: c_ulong = iow::<KvmOneReg>(KVMIO, 0xab);
 pub const KVM_SET_ONE_REG: c_ulong = iow::<KvmOneReg>(KVMIO, 0xac);
 pub const KVM_ARM_VCPU_INIT: c_ulong = iow::<KvmVcpuInit>(KVMIO, 0xae);
 pub const KVM_ARM_PREFERRED_TARGET: c_ulong = ior::<KvmVcpuInit>(KVMIO, 0xaf);
@@ -118,6 +119,10 @@ pub struct KvmRun {
 
 pub const fn reg_arm64_core_pc() -> u64 {
     KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | KVM_REG_ARM_CORE_PC
+}
+
+pub const fn reg_arm64_core_reg(index: u64) -> u64 {
+    KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | index
 }
 
 unsafe extern "C" {

@@ -78,6 +78,8 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
     let kvm_error_stop = Arc::clone(&stop);
     let vcount_stop = Arc::clone(&stop);
     let vcount_memory = Arc::clone(&shared);
+    let audio_stop = Arc::clone(&stop);
+    let audio_memory = Arc::clone(&shared);
 
     std::thread::spawn(move || {
         if let Err(err) = machine.run(kvm_stop) {
@@ -87,6 +89,7 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
     });
 
     std::thread::spawn(move || run_vcount_clock(vcount_memory, vcount_stop));
+    std::thread::spawn(move || run_audio_clock(audio_memory, audio_stop));
 
     if headless {
         let duration_ms = duration_ms.unwrap_or(500);
@@ -100,7 +103,7 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
         let lit_pixels = frame.iter().filter(|&&pixel| pixel != 0).count();
         let video = shared.debug_video_state();
         println!(
-            "kgba kvm lit_pixels={} frame_hash={:#018x} dispcnt={:#06x} bg0cnt={:#06x} bg1cnt={:#06x} bg2cnt={:#06x} bg0hofs={:#06x} bg1hofs={:#06x} keyinput={:#06x} irq_waitflags={:#06x} mosaic={:#06x} dma3cnt={:#06x} vram0={:#06x} bg0_map_nonzero={} bg0_text_1={:#06x} bg0_text_2={:#06x} cycle_digits={}{} cx_digits={}{} bg1_raster_min={:#06x} bg1_raster_max={:#06x} bg1_raster_sample={:#06x} bg1_raster_checksum={}",
+            "kgba kvm lit_pixels={} frame_hash={:#018x} dispcnt={:#06x} bg0cnt={:#06x} bg1cnt={:#06x} bg2cnt={:#06x} bg0hofs={:#06x} bg1hofs={:#06x} keyinput={:#06x} irq_waitflags={:#06x} mosaic={:#06x} dma3cnt={:#06x} palette0={:#06x} vram0={:#06x} bg0_map_nonzero={} bg0_text_1={:#06x} bg0_text_2={:#06x} cycle_digits={}{} cx_digits={}{} bg1_raster_min={:#06x} bg1_raster_max={:#06x} bg1_raster_sample={:#06x} bg1_raster_checksum={} audio_dma1sad={:#010x} audio_dma2sad={:#010x} audio_dma1cnt={:#06x} audio_dma2cnt={:#06x} audio_wave_left_nonzero={} audio_wave_right_nonzero={} maxmod_wavebuffer_var={:?} maxmod_writepos={:#010x} maxmod_mixlen={} maxmod_mix_seg={}",
             lit_pixels,
             frame_hash,
             video.dispcnt,
@@ -113,6 +116,7 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
             video.irq_waitflags,
             video.mosaic,
             video.dma3cnt,
+            video.palette0,
             video.vram0,
             video.bg0_map_nonzero,
             video.bg0_text_1,
@@ -124,7 +128,17 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
             video.bg1_raster_min,
             video.bg1_raster_max,
             video.bg1_raster_sample,
-            video.bg1_raster_checksum
+            video.bg1_raster_checksum,
+            video.audio_dma1sad,
+            video.audio_dma2sad,
+            video.audio_dma1cnt,
+            video.audio_dma2cnt,
+            video.audio_wave_left_nonzero,
+            video.audio_wave_right_nonzero,
+            video.maxmod_wavebuffer_var,
+            video.maxmod_writepos,
+            video.maxmod_mixlen,
+            video.maxmod_mix_seg
         );
         stop.store(true, Ordering::Relaxed);
         return Ok(());
@@ -134,12 +148,21 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
     let _audio = Audio::new(Arc::clone(&shared))?;
     if let Some(duration_ms) = duration_ms {
         let started = Instant::now();
+        let scripted_key = env::var("KGBA_HEADLESS_KEY")
+            .ok()
+            .and_then(|key| keyinput_for_name(&key));
+        let scripted_press_at = Duration::from_millis((duration_ms / 4).max(1));
         let mut next_present = Instant::now();
         let mut present_count = 0u64;
         let mut last_presented_seq = None;
         let mut last_keyinput = 0xffff;
         while started.elapsed() < Duration::from_millis(duration_ms) {
-            let (_, keyinput) = video.poll_events_and_input();
+            let (_, mut keyinput) = video.poll_events_and_input();
+            if let Some(scripted_key) = scripted_key {
+                if started.elapsed() >= scripted_press_at {
+                    keyinput = scripted_key;
+                }
+            }
             shared.set_keyinput(keyinput);
             trace_video_input(keyinput, &mut last_keyinput);
             let now = Instant::now();
@@ -210,6 +233,12 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
 fn run_vcount_clock(shared: Arc<kgba::kvm::KvmSharedMemory>, stop: Arc<AtomicBool>) {
     let scanline = Duration::from_nanos(73_433);
     let hdraw = Duration::from_nanos(57_213);
+    let debug_vcount0_hold = std::env::var("KGBA_DEBUG_VCOUNT0_HOLD_US")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_micros)
+        .unwrap_or_default();
+    let debug_drop_late_vcount = std::env::var_os("KGBA_DEBUG_DROP_LATE_VCOUNT").is_some();
     let mut vcount = 0u16;
     let mut next_tick = Instant::now();
     while !stop.load(Ordering::Relaxed) {
@@ -238,7 +267,35 @@ fn run_vcount_clock(shared: Arc<kgba::kvm::KvmSharedMemory>, stop: Arc<AtomicBoo
             vcount = 0;
         }
         next_tick += scanline;
+        if debug_drop_late_vcount && Instant::now().saturating_duration_since(next_tick) > scanline
+        {
+            next_tick = Instant::now() + scanline;
+        }
+        if vcount == 0 && !debug_vcount0_hold.is_zero() {
+            wait_until(Instant::now() + debug_vcount0_hold, &stop);
+        }
         wait_until(next_tick, &stop);
+    }
+}
+
+fn run_audio_clock(shared: Arc<kgba::kvm::KvmSharedMemory>, stop: Arc<AtomicBool>) {
+    let mut last = Instant::now();
+    let mut fractional_cycles = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        let elapsed_ns = now.duration_since(last).as_nanos() as u64;
+        last = now;
+
+        let total = elapsed_ns
+            .saturating_mul(GBA_CLOCK_HZ)
+            .saturating_add(fractional_cycles);
+        let cycles = total / 1_000_000_000;
+        fractional_cycles = total % 1_000_000_000;
+        if cycles != 0 {
+            shared.tick_audio_cycles(cycles.min(u64::from(u32::MAX)) as u32);
+        }
+
+        std::thread::sleep(AUDIO_CLOCK_INTERVAL);
     }
 }
 
@@ -269,11 +326,19 @@ fn wait_until(deadline: Instant, stop: &AtomicBool) {
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_742);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const HBLANK_COMPLETION_TIMEOUT: Duration = Duration::from_millis(1);
+const AUDIO_CLOCK_INTERVAL: Duration = Duration::from_micros(500);
+const GBA_CLOCK_HZ: u64 = 16_777_216;
 const KEYINPUT_RELEASED: u16 = 0x03ff;
+const KEY_A: u16 = 1 << 0;
+const KEY_B: u16 = 1 << 1;
+const KEY_SELECT: u16 = 1 << 2;
+const KEY_START: u16 = 1 << 3;
 const KEY_RIGHT: u16 = 1 << 4;
 const KEY_LEFT: u16 = 1 << 5;
 const KEY_UP: u16 = 1 << 6;
 const KEY_DOWN: u16 = 1 << 7;
+const KEY_R: u16 = 1 << 8;
+const KEY_L: u16 = 1 << 9;
 
 fn run_headless_input_script(shared: &Arc<kgba::kvm::KvmSharedMemory>, duration_ms: u64) {
     let Some(keyinput) = env::var("KGBA_HEADLESS_KEY")
@@ -297,10 +362,16 @@ fn run_headless_input_script(shared: &Arc<kgba::kvm::KvmSharedMemory>, duration_
 
 fn keyinput_for_name(name: &str) -> Option<u16> {
     let bit = match name {
+        "a" => KEY_A,
+        "b" => KEY_B,
+        "select" => KEY_SELECT,
+        "start" => KEY_START,
         "right" | "d" => KEY_RIGHT,
-        "left" | "a" => KEY_LEFT,
+        "left" => KEY_LEFT,
         "up" | "w" => KEY_UP,
         "down" | "s" => KEY_DOWN,
+        "r" => KEY_R,
+        "l" => KEY_L,
         _ => return None,
     };
     Some(KEYINPUT_RELEASED & !bit)

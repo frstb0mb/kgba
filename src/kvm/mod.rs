@@ -9,6 +9,7 @@ mod timers;
 mod trace;
 mod util;
 
+use std::io;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -26,7 +27,7 @@ use self::{
     bootstrap::{FAST_EXIT_ADDR, FAST_MEM_SIZE, FAST_MEM_START, install_bios_and_cache_bootstrap},
     fd::Fd,
     memory::MemorySlot,
-    regs::set_one_reg_u64,
+    regs::{get_one_reg_u64, set_one_reg_u64},
     run::RunMapping,
     trace::{trace_io_mmio, trace_kvm_exit},
     util::last_os_error,
@@ -52,6 +53,38 @@ pub struct KvmGba {
 
 unsafe impl Send for KvmGba {}
 
+#[derive(Debug, Clone, Copy)]
+struct ArmStrhImmediate {
+    base_reg: u8,
+    pre_index: bool,
+    writeback: bool,
+    offset: i32,
+}
+
+fn decode_arm_strh_immediate(opcode: u32) -> Option<ArmStrhImmediate> {
+    if opcode & 0x0e00_00f0 != 0x0000_00b0 {
+        return None;
+    }
+    if opcode & (1 << 22) == 0 || opcode & (1 << 20) != 0 {
+        return None;
+    }
+
+    let high = (opcode >> 8) & 0xf;
+    let low = opcode & 0xf;
+    let offset = ((high << 4) | low) as i32;
+    let signed_offset = if opcode & (1 << 23) != 0 {
+        offset
+    } else {
+        -offset
+    };
+    Some(ArmStrhImmediate {
+        base_reg: ((opcode >> 16) & 0xf) as u8,
+        pre_index: opcode & (1 << 24) != 0,
+        writeback: opcode & (1 << 21) != 0,
+        offset: signed_offset,
+    })
+}
+
 impl KvmGba {
     pub fn new(cartridge: &Cartridge) -> Result<Self, String> {
         let kvm_fd = Fd::open("/dev/kvm")?;
@@ -71,7 +104,13 @@ impl KvmGba {
 
         let mut slot_id = 0;
         let mut slots = Vec::new();
-        let bios_slot = MemorySlot::anonymous(vm_fd.raw(), &mut slot_id, BIOS_START, BIOS_SIZE, 0)?;
+        let bios_slot = MemorySlot::anonymous(
+            vm_fd.raw(),
+            &mut slot_id,
+            BIOS_START,
+            BIOS_SIZE,
+            sys::KVM_MEM_READONLY,
+        )?;
         let ewram_slot =
             MemorySlot::anonymous(vm_fd.raw(), &mut slot_id, EWRAM_START, EWRAM_SIZE, 0)?;
         let iwram_slot =
@@ -193,7 +232,14 @@ impl KvmGba {
         while !stop.load(Ordering::Relaxed) {
             let ret = unsafe { sys::ioctl_noarg(self.vcpu_fd.raw(), sys::KVM_RUN) };
             if ret != 0 {
-                return Err(last_os_error("KVM_RUN"));
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(38) && self.emulate_readonly_bios_write()? {
+                    continue;
+                }
+                if let Ok(pc) = get_one_reg_u64(self.vcpu_fd.raw(), sys::reg_arm64_core_pc()) {
+                    return Err(self.describe_kvm_run_error(&err, pc));
+                }
+                return Err(format!("KVM_RUN: {err}"));
             }
             match self.run.exit_reason() {
                 sys::KVM_EXIT_MMIO => self.handle_mmio(),
@@ -210,6 +256,62 @@ impl KvmGba {
             }
         }
         Ok(())
+    }
+
+    fn describe_kvm_run_error(&self, err: &io::Error, pc: u64) -> String {
+        let opcode = self
+            .shared
+            .debug_read_u32(pc as u32)
+            .map(|opcode| format!(" op=0x{opcode:08x}"))
+            .unwrap_or_default();
+        let r2 = get_one_reg_u64(self.vcpu_fd.raw(), sys::reg_arm64_core_reg(2 * 2))
+            .map(|value| format!(" r2=0x{value:08x}"))
+            .unwrap_or_default();
+        format!("KVM_RUN: {err} pc=0x{pc:08x}{opcode}{r2}")
+    }
+
+    fn emulate_readonly_bios_write(&self) -> Result<bool, String> {
+        let pc = get_one_reg_u64(self.vcpu_fd.raw(), sys::reg_arm64_core_pc())? as u32;
+        let Some(opcode) = self.shared.debug_read_u32(pc) else {
+            return Ok(false);
+        };
+        let Some(transfer) = decode_arm_strh_immediate(opcode) else {
+            return Ok(false);
+        };
+
+        let base = get_one_reg_u64(
+            self.vcpu_fd.raw(),
+            sys::reg_arm64_core_reg(u64::from(transfer.base_reg) * 2),
+        )
+        .map_err(|err| {
+            format!(
+                "{err} while emulating BIOS write pc=0x{pc:08x} op=0x{opcode:08x} rn={}",
+                transfer.base_reg
+            )
+        })? as u32;
+        let effective = if transfer.pre_index {
+            base.wrapping_add_signed(transfer.offset)
+        } else {
+            base
+        };
+        if !(BIOS_START..BIOS_START + BIOS_SIZE as u32).contains(&effective) {
+            return Ok(false);
+        }
+
+        if !transfer.pre_index || transfer.writeback {
+            let updated = base.wrapping_add_signed(transfer.offset);
+            set_one_reg_u64(
+                self.vcpu_fd.raw(),
+                sys::reg_arm64_core_reg(u64::from(transfer.base_reg) * 2),
+                u64::from(updated),
+            )?;
+        }
+        set_one_reg_u64(
+            self.vcpu_fd.raw(),
+            sys::reg_arm64_core_pc(),
+            u64::from(pc.wrapping_add(4)),
+        )?;
+        Ok(true)
     }
 
     fn handle_mmio(&mut self) {

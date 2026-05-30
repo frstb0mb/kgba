@@ -69,6 +69,16 @@ fiq_loop:
 swi_handler:
     ldrh r12, [lr, #-2]
     and r12, r12, #0xff
+    cmp r12, #0
+    bne swi_dispatch
+    ldr r12, [lr, #-4]
+    and r12, r12, #0xff
+    cmp r12, #0
+    bne swi_dispatch
+    ldr r12, [lr, #-4]
+    mov r12, r12, lsr #16
+    and r12, r12, #0xff
+swi_dispatch:
     cmp r12, #4
     beq intr_wait
     cmp r12, #5
@@ -77,21 +87,44 @@ swi_handler:
     bne swi_return
 
 div:
+    cmp r1, #0
+    beq div_by_zero
     mov r2, #0
     mov r3, #0
+    cmp r0, #0
+    rsblt r0, r0, #0
+    orrlt r3, r3, #2
+    eorlt r3, r3, #1
     cmp r1, #0
-    beq div_done
-    mov r3, r0
+    rsblt r1, r1, #0
+    eorlt r3, r3, #1
+    mov r12, #1
+div_align_loop:
+    cmp r1, r0, lsr #1
+    movls r1, r1, lsl #1
+    movls r12, r12, lsl #1
+    bls div_align_loop
 div_loop:
-    cmp r3, r1
-    blo div_done
-    sub r3, r3, r1
-    add r2, r2, #1
-    b div_loop
-div_done:
+    cmp r0, r1
+    subcs r0, r0, r1
+    orrcs r2, r2, r12
+    movs r12, r12, lsr #1
+    movne r1, r1, lsr #1
+    bne div_loop
+    tst r3, #1
+    rsbne r2, r2, #0
+    tst r3, #2
+    rsbne r0, r0, #0
+    mov r1, r0
     mov r0, r2
-    mov r1, r3
-    mov r3, r2
+    cmp r2, #0
+    rsblt r3, r2, #0
+    movge r3, r2
+    movs pc, lr
+
+div_by_zero:
+    mov r1, r0
+    mov r3, #0
 swi_return:
     movs pc, lr
 
@@ -100,8 +133,6 @@ vblank_intr_wait:
     mov r1, #1
 intr_wait:
     ldr r2, reg_irq_waitflags_ptr
-    mrs r3, spsr
-    stmdb sp!, {r3, lr}
     cmp r0, #0
     beq intr_wait_loop
     ldrh r3, [r2]
@@ -111,20 +142,18 @@ intr_wait_loop:
     mrs r3, cpsr
     bic r3, r3, #0x80
     msr cpsr_c, r3
-    wfi
+intr_wait_poll:
+    ldrh r3, [r2]
+    tst r3, r1
+    beq intr_wait_poll
     mrs r3, cpsr
     orr r3, r3, #0x80
     msr cpsr_c, r3
-    ldrh r3, [r2]
-    tst r3, r1
-    beq intr_wait_loop
-    ldmia sp!, {r3, lr}
-    msr spsr, r3
     movs pc, lr
 reg_irq_waitflags_ptr:
     .word REG_IRQ_WAITFLAGS
 
-.org 0x0200
+.org 0x0240
 irq_handler:
     stmdb sp!, {r0-r3,r12,lr}
     ldr r0, reg_if_ptr
