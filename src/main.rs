@@ -144,7 +144,7 @@ fn run_kvm(cartridge: &Cartridge, headless: bool, duration_ms: Option<u64>) -> R
         return Ok(());
     }
 
-    let mut video = Video::new("kgba - KVM mode 3")?;
+    let mut video = Video::new("kgba")?;
     let _audio = Audio::new(Arc::clone(&shared))?;
     if let Some(duration_ms) = duration_ms {
         let started = Instant::now();
